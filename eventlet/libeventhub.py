@@ -1,8 +1,6 @@
 """\
 @file libeventhub.py
-@author Bob Ippolito
 
-Copyright (c) 2005-2006, Bob Ippolito
 Copyright (c) 2007, Linden Research, Inc.
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -53,6 +51,10 @@ class Hub(object):
         self.clock = clock
         self.readers = {}
         self.writers = {}
+        self.interrupted = False
+
+        self.runloop = RunLoop(self.wait)
+
         self.greenlet = None
         self.stopping = False
         self.running = False
@@ -68,6 +70,9 @@ class Hub(object):
             'exit': [],
         }
         event.init()
+        
+        signal = event.signal(2, self.raise_keyboard_interrupt)
+        signal.add()
 
     def stop(self):
         self.abort()
@@ -119,13 +124,20 @@ class Hub(object):
         except Exception, e:
             print >>sys.stderr, "Exception while removing descriptor! %r" % (e,)
         
+    def raise_keyboard_interrupt(self):
+        self.interrupted = True
+            
     def wait(self, seconds=None):
+        if self.interrupted:
+            raise KeyboardInterrupt()  
+
         if not self.readers and not self.writers:
             if seconds:
                 time.sleep(seconds)
             return
-
+        
         timer = event.timeout(seconds, lambda: None)
+        timer.add()
 
         status = event.loop()
         if status == -1:
