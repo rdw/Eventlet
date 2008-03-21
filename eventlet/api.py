@@ -299,12 +299,12 @@ def get_default_hub():
         pass
 
     import select
-    if hasattr(select, 'poll'):
+    if 0:#hasattr(select, 'poll'):
         import eventlet.hubs.poll
         return eventlet.hubs.poll
     else:
-        import eventlet.hubs.selecthub
-        return eventlet.hubs.selecthub
+        import eventlet.hubs.selects
+        return eventlet.hubs.selects
 
 
 def use_hub(mod=None):
