@@ -21,7 +21,10 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
-from eventlet.api import trampoline, get_hub
+
+from eventlet.api import exc_after, TimeoutError, trampoline, get_hub
+from eventlet import util
+
 
 BUFFER_SIZE = 4096
 
@@ -90,37 +93,55 @@ def socket_accept(descriptor):
 
 
 def socket_send(descriptor, data):
+    timeout = descriptor.gettimeout()
+    if timeout:
+        cancel = exc_after(timeout, TimeoutError)
+    else:
+        cancel = None
     try:
-        return descriptor.send(data)
-    except socket.error, e:
-        if e[0] == errno.EWOULDBLOCK or e[0] == errno.ENOTCONN:
+        try:
+            return descriptor.send(data)
+        except socket.error, e:
+            if e[0] == errno.EWOULDBLOCK or e[0] == errno.ENOTCONN:
+                return 0
+            raise
+        except util.SSL.WantWriteError:
             return 0
-        raise
-    except SSL.WantWriteError:
-        return 0
-    except SSL.WantReadError:
-        return 0
+        except util.SSL.WantReadError:
+            return 0
+    finally:
+        if cancel:
+            cancel.cancel()
 
 
 # winsock sometimes throws ENOTCONN
 SOCKET_CLOSED = (errno.ECONNRESET, errno.ENOTCONN, errno.ESHUTDOWN)
 def socket_recv(descriptor, buflen):
+    timeout = descriptor.gettimeout()
+    if timeout:
+        cancel = exc_after(timeout, TimeoutError)
+    else:
+        cancel = None
     try:
-        return descriptor.recv(buflen)
-    except socket.error, e:
-        if e[0] == errno.EWOULDBLOCK:
+        try:
+            return descriptor.recv(buflen)
+        except socket.error, e:
+            if e[0] == errno.EWOULDBLOCK:
+                return None
+            if e[0] in SOCKET_CLOSED:
+                return ''
+            raise
+        except util.SSL.WantReadError:
             return None
-        if e[0] in SOCKET_CLOSED:
+        except util.SSL.ZeroReturnError:
             return ''
-        raise
-    except SSL.WantReadError:
-        return None
-    except SSL.ZeroReturnError:
-        return ''
-    except SSL.SysCallError, e:
-        if e[0] == -1 or e[0] > 0:
-            raise socket.error(errno.ECONNRESET, errno.errorcode[errno.ECONNRESET])
-        raise
+        except util.SSL.SysCallError, e:
+            if e[0] == -1 or e[0] > 0:
+                raise socket.error(errno.ECONNRESET, errno.errorcode[errno.ECONNRESET])
+            raise
+    finally:
+        if cancel:
+            cancel.cancel()
 
 
 def file_recv(fd, buflen):
@@ -164,7 +185,7 @@ def set_nonblocking(fd):
 
 class GreenSocket(object):
     is_secure = False
-    
+    timeout = None
     def __init__(self, fd):
         set_nonblocking(fd)
         self.fd = fd
@@ -270,9 +291,6 @@ class GreenSocket(object):
         fn = self.setblocking = self.fd.setblocking
         return fn(*args, **kw)
     
-    # TODO settimeout
-    # TODO gettimeout
-    
     def setsockopt(self, *args, **kw):
         fn = self.setsockopt = self.fd.setsockopt
         return fn(*args, **kw)
@@ -281,14 +299,51 @@ class GreenSocket(object):
         fn = self.shutdown = self.fd.shutdown
         return fn(*args, **kw)
 
+    def settimeout(self, howlong):
+        self.timeout = howlong
 
-    
+    def gettimeout(self):
+        return self.timeout
+
+
+def read(self, size=None):
+    if size is not None and not isinstance(size, (int, long)):
+        raise TypeError('Expecting an int or long for size, got %s: %s' % (type(size), repr(size)))
+    buf, self.sock.recvbuffer = self.sock.recvbuffer, ''
+    lst = [buf]
+    if size is None:
+        while True:
+            d = self.sock.recv(BUFFER_SIZE)
+            if not d:
+                break
+            lst.append(d)
+    else:
+        buflen = len(buf)
+        while buflen < size:
+            d = self.sock.recv(BUFFER_SIZE)
+            if not d:
+                break
+            buflen += len(d)
+            lst.append(d)
+        else:
+            d = lst[-1]
+            overbite = buflen - size
+            if overbite:
+                lst[-1], self.sock.recvbuffer = d[:-overbite], d[-overbite:]
+            else:
+                lst[-1], self.sock.recvbuffer = d, ''
+    return ''.join(lst)
+
+
 class GreenFile(object):
     newlines = '\r\n'
     mode = 'wb+'
 
     def __init__(self, fd):
-        set_nonblocking(fd)
+        if isinstance(fd, GreenSocket):
+            set_nonblocking(fd.fd)
+        else:
+            set_nonblocking(fd)
         self.sock = fd
         self.closed = False
 
@@ -365,33 +420,7 @@ class GreenFile(object):
         for line in lines:
             self.write(line)
         
-    def read(self, size=None):
-        if size is not None and not isinstance(size, (int, long)):
-            raise TypeError('Expecting an int or long for size, got %s: %s' % (type(size), repr(size)))
-        buf, self.sock.recvbuffer = self.sock.recvbuffer, ''
-        lst = [buf]
-        if size is None:
-            while True:
-                d = self.sock.recv(BUFFER_SIZE)
-                if not d:
-                    break
-                lst.append(d)
-        else:
-            buflen = len(buf)
-            while buflen < size:
-                d = self.sock.recv(BUFFER_SIZE)
-                if not d:
-                    break
-                buflen += len(d)
-                lst.append(d)
-            else:
-                d = lst[-1]
-                overbite = buflen - size
-                if overbite:
-                    lst[-1], self.sock.recvbuffer = d[:-overbite], d[-overbite:]
-                else:
-                    lst[-1], self.sock.recvbuffer = d, ''
-        return ''.join(lst)
+    read = read
 
 
 class GreenPipeSocket(GreenSocket):
@@ -419,4 +448,20 @@ class GreenPipe(GreenFile):
     def flush(self):
         self.fd.fd.flush()
 
+
+class GreenSSL(GreenSocket):
+    def __init__(self, fd):
+        GreenSocket.__init__(self, fd)
+        self.sock = self
+
+    read = read
+
+    def write(self, data):
+        return self.sendall(data)
+
+    def server(self):
+        return self.fd.server()
+
+    def issuer(self):
+        return self.fd.issuer()
 

@@ -41,6 +41,9 @@ from eventlet import pools
 DEFAULT_MAX_SIMULTANEOUS_REQUESTS = 1024
 
 
+DEFAULT_MAX_HTTP_VERSION = 'HTTP/1.1'
+
+
 class Input(object):
     def __init__(self, rfile, content_length, wfile=None, wfile_line=None):
         self.rfile = rfile
@@ -80,6 +83,9 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
             format % args))
 
     def handle_one_request(self):
+        if self.server.max_http_version:
+            self.protocol_version = self.server.max_http_version
+
         try:
             self.raw_requestline = self.rfile.readline()
         except socket.error, e:
@@ -125,18 +131,20 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
                 for k, v in response_headers:
                     header_dict[k.lower()] = k
                 towrite.append('%s %s\r\n' % (self.protocol_version, status))
+                for header in response_headers:
+                    towrite.append('%s: %s\r\n' % header)
+
                 # send Date header?
                 if 'date' not in header_dict:
                     towrite.append('Date: %s\r\n' % (format_date_time(time.time()),))
                 if num_blocks is not None:
-                    towrite.append('Content-Length: %s\r\n' % (len(''.join(result)),))
+                    if 'content-length' not in header_dict:
+                        towrite.append('Content-Length: %s\r\n' % (len(''.join(result)),))
                 elif use_chunked:
                     towrite.append('Transfer-Encoding: chunked\r\n')
                 else:
                     towrite.append('Connection: close\r\n')
                     self.close_connection = 1
-                for header in response_headers:
-                    towrite.append('%s: %s\r\n' % header)
                 towrite.append('\r\n')
 
             if use_chunked:
@@ -162,7 +170,7 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
         try:
             result = self.server.app(self.environ, start_response)
         except Exception, e:
-            exc = traceback.format_exc()
+            exc = ''.join(traceback.format_exception(*sys.exc_info()))
             print exc
             if not headers_set:
                 start_response("500 Internal Server Error", [('Content-type', 'text/plain')])
@@ -174,38 +182,41 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
         except (TypeError, AttributeError, NotImplementedError):
             if self.protocol_version == 'HTTP/1.1':
                 use_chunked = True
-
         try:
-            towrite = []
             try:
-                for data in result:
-                    if data:
-                        towrite.append(data)
-                        if reduce(
-                            lambda x, y: x + y,
-                            map(
-                                lambda x: len(x), towrite)) > 4096:
-                            write(''.join(towrite))
-                            del towrite[:]
+                towrite = []
+                try:
+                    for data in result:
+                        if data:
+                            towrite.append(data)
+                            if reduce(
+                                lambda x, y: x + y,
+                                map(
+                                    lambda x: len(x), towrite)) > 4096:
+                                write(''.join(towrite))
+                                del towrite[:]
+                except Exception, e:
+                    exc = traceback.format_exc()
+                    print exc
+                    if not headers_set:
+                        start_response("500 Internal Server Error", [('Content-type', 'text/plain')])
+                        write(exc)
+                        return
+    
+                if towrite:
+                    write(''.join(towrite))
+                if use_chunked:
+                    wfile.write('0\r\n\r\n')
+                if not headers_sent:
+                    write('')
             except Exception, e:
-                exc = traceback.format_exc()
-                print exc
-                if not headers_set:
-                    start_response("500 Internal Server Error", [('Content-type', 'text/plain')])
-                    write(exc)
-                    return
-
-            if towrite:
-                write(''.join(towrite))
-            if use_chunked:
-                wfile.write('0\r\n\r\n')
-            if not headers_sent:
-                write('')
-        except Exception, e:
-            traceback.print_exc()
+                traceback.print_exc()
         finally:
             if hasattr(result, 'close'):
                 result.close()
+            if self.environ['eventlet.input'].position < self.environ.get('CONTENT_LENGTH', 0):
+                ## Read and discard body
+                self.environ['eventlet.input'].read()
 
     def get_environ(self):
         env = self.server.get_environ()
@@ -253,7 +264,7 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
         else:
             wfile = None
             wfile_line = None
-        env['wsgi.input'] = Input(
+        env['wsgi.input'] = env['eventlet.input'] = Input(
             self.rfile, length, wfile=wfile, wfile_line=wfile_line)
 
         return env
@@ -264,7 +275,7 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
 
 
 class Server(BaseHTTPServer.HTTPServer):
-    def __init__(self, socket, address, app, log, environ=None):
+    def __init__(self, socket, address, app, log, environ=None, max_http_version=None):
         self.socket = socket
         self.address = address
         if log:
@@ -273,6 +284,7 @@ class Server(BaseHTTPServer.HTTPServer):
             self.log = sys.stderr
         self.app = app
         self.environ = environ
+        self.max_http_version = max_http_version            
 
     def get_environ(self):
         socket = self.socket
@@ -296,8 +308,9 @@ class Server(BaseHTTPServer.HTTPServer):
         self.log.write(message + '\n')
 
 
-def server(sock, site, log=None, environ=None, max_size=None):
-    serv = Server(sock, sock.getsockname(), site, log, environ=None)
+
+def server(sock, site, log=None, environ=None, max_size=None, max_http_version=DEFAULT_MAX_HTTP_VERSION):
+    serv = Server(sock, sock.getsockname(), site, log, environ=None, max_http_version=max_http_version)
     if max_size is None:
         max_size = DEFAULT_MAX_SIMULTANEOUS_REQUESTS
     pool = pools.CoroutinePool(max_size=max_size)
