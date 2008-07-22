@@ -130,10 +130,6 @@ class wrapped_fd(object):
         fn = self.setblocking = self.fd.setblocking
         return fn(*args, **kw)
 
-    def shutdown(self, *args, **kw):
-        fn = self.shutdown = self.fd.shutdown
-        return fn(*args, **kw)
-
     def close(self, *args, **kw):
         if self._closed:
             return
