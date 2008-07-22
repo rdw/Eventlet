@@ -44,6 +44,11 @@ class Cancelled(RuntimeError):
     pass
 
 
+class ExceptionWrapper(object):
+    def __init__(self, e):
+        self.e = e
+
+
 NOT_USED = object()
 
 
@@ -95,6 +100,14 @@ class event(object):
         self.epoch = time.time()
         self._result = NOT_USED
         self._waiters = {}
+        
+    def ready(self):
+        """ Return true if the wait() call will return immediately. 
+        Used to avoid waiting for things that might take a while to time out.
+        For example, you can put a bunch of events into a list, and then visit
+        them all repeatedly, calling ready() until one returns True, and then
+        you can wait() on that one."""
+        return self._result is not NOT_USED
 
     def wait(self):
         """Wait until another coroutine calls send.
@@ -252,20 +265,30 @@ class CoroutinePool(pools.Pool):
     foo 4
     """
     
-    def __init__(self, min_size=0, max_size=4):
+    def __init__(self, min_size=0, max_size=4, track_events=False):
         self._greenlets = set()
+        if track_events:
+            self._tracked_events = []
+            self._next_event = None
+        else:
+            self._tracked_events = None
         super(CoroutinePool, self).__init__(min_size, max_size)
     
     def _main_loop(self, sender):
         """ Private, infinite loop run by a pooled coroutine. """
-        while True:
-            recvd = sender.wait()
-            sender.reset()
-            (evt, func, args, kw) = recvd
-            self._safe_apply(evt, func, args, kw)
-            api.get_hub().runloop.cancel_timers(api.getcurrent())
-            self.put(sender)
-            
+        try:
+            while True:
+                recvd = sender.wait()
+                sender = event()
+                (evt, func, args, kw) = recvd
+                self._safe_apply(evt, func, args, kw)
+                api.get_hub().cancel_timers(api.getcurrent())
+                self.put(sender)
+        finally:
+            # if we get here, something broke badly, and all we can really
+            # do is try to keep the pool from leaking items
+            self.put(self.create())
+
     def _safe_apply(self, evt, func, args, kw):
         """ Private method that runs the function, catches exceptions, and
         passes back the return value in the event."""
@@ -273,6 +296,14 @@ class CoroutinePool(pools.Pool):
             result = func(*args, **kw)
             if evt is not None:
                 evt.send(result)
+                if self._tracked_events is not None:
+                    if self._next_event is None:
+                        self._tracked_events.append(result)
+                    else:
+                        
+                        ne = self._next_event
+                        self._next_event = None
+                        ne.send(result)
         except api.GreenletExit, e:
             # we're printing this out to see if it ever happens
             # in practice
@@ -285,7 +316,14 @@ class CoroutinePool(pools.Pool):
             traceback.print_exc()
             if evt is not None:
                 evt.send(exc=e)
-                
+            if self._tracked_events is not None:
+                if self._next_event is None:
+                    self._tracked_events.append(ExceptionWrapper(e))
+                else:
+                    ne = self._next_event
+                    self._next_event = None
+                    ne.send(exc=e)
+
     def _execute(self, evt, func, args, kw):
         """ Private implementation of the execute methods.
         """
@@ -340,6 +378,34 @@ class CoroutinePool(pools.Pool):
         foo 1
         """
         self._execute(None, func, args, kw)
+
+    def wait(self):
+        """Wait for the next execute in the pool to complete,
+        and return the result.
+
+        You must pass track_events=True to the CoroutinePool constructor
+        in order to use this method.
+        """
+        assert self._tracked_events is not None, (
+            "Must pass track_events=True to the constructor to use CoroutinePool.wait()")
+        if self._next_event is not None:
+            return self._next_event.wait()
+
+        if not self._tracked_events:
+            self._next_event = event()
+            return self._next_event.wait()
+
+        result = self._tracked_events.pop(0)
+        if isinstance(result, ExceptionWrapper):
+            raise result.e
+
+        if not self._tracked_events:
+            self._next_event = event()
+        return result
+
+    def killall(self):
+        for g in self._greenlets:
+            api.kill(g)
 
 
 class pipe(object):
