@@ -130,6 +130,13 @@ class wrapped_fd(object):
         fn = self.setblocking = self.fd.setblocking
         return fn(*args, **kw)
 
+    def shutdown(self, *args, **kw):
+        if self.is_secure:
+            fn = self.shutdown = self.fd.sock_shutdown
+        else:
+            fn = self.shutdown = self.fd.shutdown
+        return fn(*args, **kw)
+
     def close(self, *args, **kw):
         if self._closed:
             return
@@ -137,6 +144,11 @@ class wrapped_fd(object):
         if self._refcount.is_referenced():
             return
         self._closed = True
+        if self.is_secure:
+            # *NOTE: This is not quite the correct SSL shutdown sequence.
+            # We should actually be checking the return value of shutdown.
+            # Note also that this is not the same as calling self.shutdown().
+            self.fd.shutdown()
         fn = self.close = self.fd.close
         try:
             res = fn(*args, **kw)
@@ -154,13 +166,13 @@ class wrapped_fd(object):
                 client, addr = res
                 util.set_nonblocking(client)
                 return type(self)(client), addr
-            trampoline(fd, read=True, write=True)
+            trampoline(fd, read=True)
 
     def connect(self, address):
         fd = self.fd
         connect = util.socket_connect
         while not connect(fd, address):
-            trampoline(fd, read=True, write=True)
+            trampoline(fd, write=True)
 
     recv = higher_order_recv(util.socket_recv)
 
