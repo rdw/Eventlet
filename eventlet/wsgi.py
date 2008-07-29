@@ -30,7 +30,6 @@ import time
 import traceback
 import urllib
 import socket
-import cStringIO
 import SocketServer
 import BaseHTTPServer
 
@@ -92,12 +91,6 @@ MAX_REQUEST_LINE = 8192
 
 class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
-    def log_message(self, format, *args):
-        self.server.log_message("(%s) %s - - [%s] %s" % (
-            self.server.pid,
-            self.address_string(),
-            self.log_date_time_string(),
-            format % args))
 
     def handle_one_request(self):
         if self.server.max_http_version:
@@ -197,7 +190,10 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
                     # Avoid dangling circular ref
                     exc_info = None
 
-            headers_set[:] = [status, response_headers]
+            capitalized_headers = [('-'.join([x.capitalize() for x in key.split('-')]), value)
+                                   for key, value in response_headers]
+
+            headers_set[:] = [status, capitalized_headers]
             return write
 
         try:
@@ -248,9 +244,14 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
                 ## Read and discard body
                 self.environ['eventlet.input'].read()
             finish = time.time()
-            self.log_message(
-                '"%s" %s %s %.6f\n' % (
-                    self.requestline, status_code[0], length[0], finish - start))
+
+            self.server.log_message('%s - - [%s] "%s" %s %s %.6f\n' % (
+                self.address_string(),
+                self.log_date_time_string(),
+                self.requestline,
+                status_code[0],
+                length[0],
+                finish - start))
 
     def get_environ(self):
         env = self.server.get_environ()
@@ -367,7 +368,11 @@ def server(sock, site, log=None, environ=None, max_size=None, max_http_version=D
         print "(%s) wsgi starting up on %s://%s%s/" % (os.getpid(), scheme, host, port)
         while True:
             try:
-                client_socket = sock.accept()
+                try:
+                    client_socket = sock.accept()
+                except socket.error, e:
+                    if e[0] != errno.EPIPE and e[0] != errno.EBADF:
+                        raise
                 pool.execute_async(serv.process_request, client_socket)
             except KeyboardInterrupt:
                 api.get_hub().remove_descriptor(sock.fileno())
