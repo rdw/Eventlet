@@ -22,6 +22,7 @@ THE SOFTWARE.
 """
 
 import bisect
+import weakref
 import sys
 import socket
 import errno
@@ -77,10 +78,21 @@ class BaseHub(object):
         so the exc callback happens instead of the respective read or write
         callback.
         """
-        
-        self.readers[fileno] = read or self.readers.get(fileno)
-        self.writers[fileno] = write or self.writers.get(fileno)
-        self.excs[fileno] = exc or self.excs.get(fileno)
+        read = read or self.readers.get(fileno)
+        if read is not None:
+            self.readers[fileno] = read
+        else:
+            self.readers.pop(fileno, None)
+        write = write or self.writers.get(fileno)
+        if write is not None:
+            self.writers[fileno] = write
+        else:
+            self.writers.pop(fileno, None)
+        exc = exc or self.excs.get(fileno)
+        if exc is not None:
+            self.excs[fileno] = exc
+        else:
+            self.excs.pop(fileno, None)
         self.waiters_by_greenlet[greenlet.getcurrent()] = fileno
         
     def remove_descriptor(self, fileno):
@@ -237,12 +249,20 @@ class BaseHub(object):
     def track_timer(self, timer):
         current_greenlet = greenlet.getcurrent()
         timer.greenlet = current_greenlet
-        if current_greenlet not in self.timers_by_greenlet:
-            self.timers_by_greenlet[current_greenlet] = {}
-        self.timers_by_greenlet[current_greenlet][timer] = True
+        self.timers_by_greenlet.setdefault(
+            current_greenlet,
+            weakref.WeakKeyDictionary())[timer] = True
+
+    def timer_finished(self, timer):
+        try:
+            del self.timers_by_greenlet[timer.greenlet][timer]
+            if not self.timers_by_greenlet[timer.greenlet]:
+                del self.timers_by_greenlet[timer.greenlet]
+        except KeyError:
+            pass
 
     def timer_canceled(self, timer):
-        pass
+        self.timer_finished(timer)
 
     def prepare_timers(self):
         ins = bisect.insort_right
@@ -277,21 +297,26 @@ class BaseHub(object):
                 except:
                     self.squelch_timer_exception(timer, sys.exc_info())
             finally:
-                try:
-                    del self.timers_by_greenlet[timer.greenlet][timer]
-                except KeyError:
-                    pass
+                self.timer_finished(timer)
         del t[:last]
 
     def cancel_timers(self, greenlet, quiet=False):
         if greenlet not in self.timers_by_greenlet:
             return
-        for timer in self.timers_by_greenlet[greenlet]:
+        for timer in self.timers_by_greenlet[greenlet].keys():
             if not timer.cancelled and not timer.called and timer.seconds:
                 ## If timer.seconds is 0, this isn't a timer, it's
                 ## actually eventlet's silly way of specifying whether
                 ## a coroutine is "ready to run" or not.
-                timer.cancel()
+                try:
+                    # this might be None due to weirdness with weakrefs
+                    timer.cancel()
+                except TypeError:
+                    pass
                 if _g_debug and not quiet:
                     print 'Hub cancelling left-over timer %s' % timer
-        del self.timers_by_greenlet[greenlet]
+        try:
+            del self.timers_by_greenlet[greenlet]
+        except KeyError:
+            pass
+
