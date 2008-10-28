@@ -22,8 +22,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
 
-from eventlet.api import exc_after, TimeoutError, trampoline, get_hub
+from eventlet.api import trampoline, get_hub
 from eventlet import util
+
+from twisted.internet.error import ConnectionDone
 
 
 BUFFER_SIZE = 4096
@@ -32,6 +34,7 @@ import errno
 import os
 import socket
 import fcntl
+import time
 
 
 from errno import EWOULDBLOCK, EAGAIN
@@ -41,15 +44,29 @@ __all__ = ['GreenSocket', 'GreenFile', 'GreenPipe']
 
 def higher_order_recv(recv_func):
     def recv(self, buflen):
+        if self.act_non_blocking:
+            return self.fd.recv(buflen)
         buf = self.recvbuffer
         if buf:
             chunk, self.recvbuffer = buf[:buflen], buf[buflen:]
             return chunk
         fd = self.fd
         bytes = recv_func(fd, buflen)
+        if self.gettimeout():
+            end = time.time()+self.gettimeout()
+        else:
+            end = None
+        timeout = None
         while bytes is None:
             try:
-                trampoline(fd, read=True)
+                if end:
+                    timeout = end - time.time()
+                trampoline(fd, read=True, timeout=timeout, timeout_exc=socket.timeout)
+            except socket.timeout:
+                raise
+            except ConnectionDone:
+                #sys.stderr.write('ConnectionDone in recv -> returning empty string\n')
+                return ''
             except socket.error, e:
                 if e[0] == errno.EPIPE:
                     bytes = ''
@@ -64,6 +81,8 @@ def higher_order_recv(recv_func):
 
 def higher_order_send(send_func):
     def send(self, data):
+        if self.act_non_blocking:
+            return self.fd.send(buflen)
         count = send_func(self.fd, data)
         if not count:
             return 0
@@ -93,55 +112,37 @@ def socket_accept(descriptor):
 
 
 def socket_send(descriptor, data):
-    timeout = descriptor.gettimeout()
-    if timeout:
-        cancel = exc_after(timeout, TimeoutError)
-    else:
-        cancel = None
     try:
-        try:
-            return descriptor.send(data)
-        except socket.error, e:
-            if e[0] == errno.EWOULDBLOCK or e[0] == errno.ENOTCONN:
-                return 0
-            raise
-        except util.SSL.WantWriteError:
+        return descriptor.send(data)
+    except socket.error, e:
+        if e[0] == errno.EWOULDBLOCK or e[0] == errno.ENOTCONN:
             return 0
-        except util.SSL.WantReadError:
-            return 0
-    finally:
-        if cancel:
-            cancel.cancel()
+        raise
+    except util.SSL.WantWriteError:
+        return 0
+    except util.SSL.WantReadError:
+        return 0
 
 
 # winsock sometimes throws ENOTCONN
 SOCKET_CLOSED = (errno.ECONNRESET, errno.ENOTCONN, errno.ESHUTDOWN)
 def socket_recv(descriptor, buflen):
-    timeout = descriptor.gettimeout()
-    if timeout:
-        cancel = exc_after(timeout, TimeoutError)
-    else:
-        cancel = None
     try:
-        try:
-            return descriptor.recv(buflen)
-        except socket.error, e:
-            if e[0] == errno.EWOULDBLOCK:
-                return None
-            if e[0] in SOCKET_CLOSED:
-                return ''
-            raise
-        except util.SSL.WantReadError:
+        return descriptor.recv(buflen)
+    except socket.error, e:
+        if e[0] == errno.EWOULDBLOCK:
             return None
-        except util.SSL.ZeroReturnError:
+        if e[0] in SOCKET_CLOSED:
             return ''
-        except util.SSL.SysCallError, e:
-            if e[0] == -1 or e[0] > 0:
-                return ''
-            raise
-    finally:
-        if cancel:
-            cancel.cancel()
+        raise
+    except util.SSL.WantReadError:
+        return None
+    except util.SSL.ZeroReturnError:
+        return ''
+    except util.SSL.SysCallError, e:
+        if e[0] == -1 or e[0] > 0:
+            return ''
+        raise
 
 
 def file_recv(fd, buflen):
@@ -186,7 +187,14 @@ def set_nonblocking(fd):
 class GreenSocket(object):
     is_secure = False
     timeout = None
-    def __init__(self, fd):
+    def __init__(self, family_or_fd=socket.AF_INET, *args, **kwargs):
+        if isinstance(family_or_fd, (int, long)):
+            fd = socket.socket(family_or_fd, *args, **kwargs)
+        else:
+            fd = family_or_fd
+            assert not args, args
+            assert not kwargs, kwargs
+
         set_nonblocking(fd)
         self.fd = fd
         self._fileno = fd.fileno()
@@ -194,8 +202,27 @@ class GreenSocket(object):
         self.recvcount = 0
         self.recvbuffer = ''
         self.closed = False
+        self.timeout = socket.getdefaulttimeout()
+
+        # when client calls setblocking(0) or settimeout(0) the socket must
+        # act non-blocking
+        self.act_non_blocking = False
+
+    @property
+    def family(self):
+        return self.fd.family
+
+    @property
+    def type(self):
+        return self.fd.type
+
+    @property
+    def proto(self):
+        return self.fd.proto
 
     def accept(self):
+        if self.act_non_blocking:
+            return self.fd.accept()
         fd = self.fd
         while True:
             res = socket_accept(fd)
@@ -203,12 +230,12 @@ class GreenSocket(object):
                 client, addr = res
                 set_nonblocking(client)
                 return type(self)(client), addr
-            trampoline(fd, read=True)
-            
+            trampoline(fd, read=True, timeout=self.gettimeout(), timeout_exc=socket.timeout)
+
     def bind(self, *args, **kw):
         fn = self.bind = self.fd.bind
         return fn(*args, **kw)
-    
+
     def close(self, *args, **kw):
         if self.closed:
             return
@@ -227,80 +254,102 @@ class GreenSocket(object):
             # a caller waiting on trampoline (e.g. server on .accept())
             get_hub().exc_descriptor(self._fileno)
         return res
-        
+
     def connect(self, address):
+        if self.act_non_blocking:
+            return self.fd.connect(address)
         fd = self.fd
         connect = socket_connect
-        while not connect(fd, address):
-            trampoline(fd, write=True)
-            
-    def connect_ex(self, *args, **kw):
-        fn = self.connect_ex = self.fd.connect_ex
-        return fn(*args, **kw)
-        
+        if self.gettimeout() is None:
+            while not connect(fd, address):
+                trampoline(fd, write=True, timeout_exc=socket.timeout)
+        else:
+            end = time.time() + self.gettimeout()
+            while True:
+                if connect(fd, address):
+                    return
+                if time.time() >= end:
+                    raise socket.timeout
+                trampoline(fd, write=True, timeout=end-time.time(), timeout_exc=socket.timeout)
+
     def dup(self, *args, **kw):
         sock = self.fd.dup(*args, **kw)
         set_nonblocking(sock)
         return type(self)(sock)
-    
+
     def fileno(self, *args, **kw):
         fn = self.fileno = self.fd.fileno
         return fn(*args, **kw)
-        
+
     def getpeername(self, *args, **kw):
         fn = self.getpeername = self.fd.getpeername
         return fn(*args, **kw)
-    
+
     def getsockname(self, *args, **kw):
         fn = self.getsockname = self.fd.getsockname
         return fn(*args, **kw)
-    
+
     def getsockopt(self, *args, **kw):
         fn = self.getsockopt = self.fd.getsockopt
         return fn(*args, **kw)
-    
+
     def listen(self, *args, **kw):
         fn = self.listen = self.fd.listen
         return fn(*args, **kw)
-    
+
     def old_makefile(self, *args, **kw):
         self._refcount.increment()
         new_sock = type(self)(self.fd, self._refcount)
         return GreenFile(new_sock)
-    
-    def makefile(self, mode = None, bufsize = None):
-        return GreenFile(self.dup())
-    
+
+    def makefile(self, mode='r', bufsize=-1):
+        return socket._fileobject(self.dup(), mode, bufsize)
+        # the following has problems, e.g. it doesn't recognise '\n' as a delimeter
+        #return GreenFile(self.dup())
+
     recv = higher_order_recv(socket_recv)
-    
+
     def recvfrom(self, *args):
-        trampoline(self.fd, read=True)
+        if not self.act_non_blocking:
+            trampoline(self.fd, read=True, timeout=self.gettimeout(), timeout_exc=socket.timeout)
         return self.fd.recvfrom(*args)
-    
-    # TODO recvfrom_into
-    # TODO recv_into
-    
+
+    def recvfrom_into(self, *args):
+        if not self.act_non_blocking:
+            trampoline(self.fd, read=True, timeout=self.gettimeout(), timeout_exc=socket.timeout)
+        return self.fd.recvfrom_into(*args)
+
+    def recv_into(self, *args):
+        if not self.act_non_blocking:
+            trampoline(self.fd, read=True, timeout=self.gettimeout(), timeout_exc=socket.timeout)
+        return self.fd.recv_into(*args)
+
     send = higher_order_send(socket_send)
-    
+
     def sendall(self, data):
         fd = self.fd
         tail = self.send(data)
         while tail < len(data):
-            trampoline(self.fd, write=True)
+            trampoline(self.fd, write=True, timeout_exc=socket.timeout)
             tail += self.send(data[tail:])
-        
+
     def sendto(self, *args):
-        trampoline(self.fd, write=True)
+        trampoline(self.fd, write=True, timeout_exc=socket.timeout)
         return self.fd.sendto(*args)
-    
-    def setblocking(self, *args, **kw):
-        fn = self.setblocking = self.fd.setblocking
-        return fn(*args, **kw)
-    
+
+    def setblocking(self, flag):
+        self.fd.setblocking(flag)
+        if flag:
+            self.act_non_blocking = False
+            self.timeout = None
+        else:
+            self.act_non_blocking = True
+            self.timeout = 0.0
+
     def setsockopt(self, *args, **kw):
         fn = self.setsockopt = self.fd.setsockopt
         return fn(*args, **kw)
-    
+
     def shutdown(self, *args, **kw):
         if self.is_secure:
             fn = self.shutdown = self.fd.sock_shutdown
@@ -309,11 +358,23 @@ class GreenSocket(object):
         return fn(*args, **kw)
 
     def settimeout(self, howlong):
-        self.timeout = howlong
+        if howlong is None:
+            self.setblocking(True)
+            return
+        try:
+            f = howlong.__float__
+        except AttributeError:
+            raise TypeError('a float is required')
+        howlong = f()
+        if howlong < 0.0:
+            raise ValueError('Timeout value out of range')
+        if howlong == 0.0:
+            self.setblocking(howlong)
+        else:
+            self.timeout = howlong
 
     def gettimeout(self):
         return self.timeout
-
 
 def read(self, size=None):
     if size is not None and not isinstance(size, (int, long)):
@@ -359,10 +420,10 @@ class GreenFile(object):
     def close(self):
         self.sock.close()
         self.closed = True
-        
+
     def fileno(self):
         return self.sock.fileno()
-    
+
     # TODO next
 
     def flush(self):
@@ -370,7 +431,7 @@ class GreenFile(object):
 
     def write(self, data):
         return self.sock.sendall(data)
-    
+
     def readuntil(self, terminator, size=None):
         buf, self.sock.recvbuffer = self.sock.recvbuffer, ''
         checked = 0
@@ -400,7 +461,7 @@ class GreenFile(object):
             buf += d
         chunk, self.sock.recvbuffer = buf[:size], buf[size:]
         return chunk
-        
+
     def readline(self, size=None):
         return self.readuntil(self.newlines, size=size)
 
@@ -428,7 +489,7 @@ class GreenFile(object):
     def writelines(self, lines):
         for line in lines:
             self.write(line)
-        
+
     read = read
 
 

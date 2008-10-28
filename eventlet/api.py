@@ -30,27 +30,7 @@ import linecache
 import inspect
 import traceback
 
-try:
-    import greenlet
-except ImportError:
-    try:
-        import support.pylib
-        support.pylib.emulate()
-        greenlet = sys.modules['greenlet']
-    except ImportError:
-        try:
-            import support.stacklesspypys
-            support.stacklesspypys.emulate()
-            greenlet = sys.modules['greenlet']
-        except ImportError:
-            try:
-                import support.stacklesss
-                support.stacklesss.emulate()
-                greenlet = sys.modules['greenlet']                
-            except ImportError, e:
-                raise ImportError("Unable to find an implementation of greenlet.")
-
-
+from eventlet.support import greenlet
 from eventlet import greenlib, tls
 
 __all__ = [
@@ -140,7 +120,7 @@ def tcp_server(listensocket, server, *args, **kw):
     finally:
         listensocket.close()
 
-def trampoline(fd, read=None, write=None, timeout=None):
+def trampoline(fd, read=None, write=None, timeout=None, timeout_exc=TimeoutError):
     """Suspend the current coroutine until the given socket object or file
     descriptor is ready to *read*, ready to *write*, or the specified
     *timeout* elapses, depending on arguments specified.
@@ -150,28 +130,91 @@ def trampoline(fd, read=None, write=None, timeout=None):
     argument in seconds.
 
     If the specified *timeout* elapses before the socket is ready to read or
-    write, ``TimeoutError`` will be raised instead of ``trampoline()``
+    write, *timeout_exc* will be raised instead of ``trampoline()``
     returning normally.
     """
     t = None
     hub = get_hub()
     self = greenlet.getcurrent()
     fileno = getattr(fd, 'fileno', lambda: fd)()
-    def _do_close(fn):
-        hub.remove_descriptor(fn)
-        greenlib.switch(self, exc=socket.error(32, 'Broken pipe'))
-    def _do_timeout():
-        hub.remove_descriptor(fileno)
-        greenlib.switch(self, exc=TimeoutError())
-    def cb(_fileno):
+    def _do_close(_d, error=None):
         if t is not None:
             t.cancel()
-        hub.remove_descriptor(fileno)
+        hub.remove_descriptor(descriptor)
+        greenlib.switch(self, exc=getattr(error, 'value', None)) # convert to socket.error
+    def _do_timeout():
+        hub.remove_descriptor(descriptor)
+        greenlib.switch(self, exc=timeout_exc())
+    def cb(d):
+        if t is not None:
+            t.cancel()
+        hub.remove_descriptor(descriptor)
         greenlib.switch(self, fd)
     if timeout is not None:
         t = hub.schedule_call(timeout, _do_timeout)
-    hub.add_descriptor(fileno, read and cb, write and cb, _do_close)
+    descriptor = hub.add_descriptor(fileno, read and cb, write and cb, _do_close)
     return hub.switch()
+
+def get_fileno(obj):
+    try:
+        f = obj.fileno
+    except AttributeError:
+        assert isinstance(obj, (int, long))
+        return obj
+    else:
+        return f()
+
+def select(read_list, write_list, error_list, timeout=None):
+    self = get_hub()
+    t = None
+    current = greenlet.getcurrent()
+    ds = {}
+    for r in read_list:
+        ds[get_fileno(r)] = {'read' : r}
+    for w in write_list:
+        ds.setdefault(get_fileno(w), {})['write'] = w
+    for e in error_list:
+        ds.setdefault(get_fileno(e), {})['error'] = e
+
+    descriptors = []
+
+    def cleanup(t):
+        if t is not None:
+            t.cancel()
+        for d in descriptors:
+            self.remove_descriptor(d)
+
+    def on_read(d):
+        cleanup(t)
+        original = ds[get_fileno(d)]['read']
+        greenlib.switch(current, ([original], [], []))
+
+    def on_write(d):
+        cleanup(t)
+        original = ds[get_fileno(d)]['write']
+        greenlib.switch(current, ([], [original], []))
+
+    def on_error(d, _err=None):
+        cleanup(t)
+        original = ds[get_fileno(d)]['error']
+        greenlib.switch(current, ([], [], [original]))
+
+    def on_timeout():
+        cleanup(None)
+        greenlib.switch(current, ([], [], []))
+
+    if timeout is not None:
+        t = self.schedule_call(timeout, on_timeout)
+
+    for k, v in ds.iteritems():
+        d = self.add_descriptor(k,
+                                v.get('read') is not None and on_read,
+                                v.get('write') is not None and on_write,
+                                v.get('error') is not None and on_error)
+        descriptors.append(d)
+
+    return self.switch()
+
 
 def _spawn_startup(cb, args, kw, cancel=None):
     try:
@@ -309,8 +352,14 @@ def exc_after(seconds, exception_object):
 
 def get_default_hub():
     """Select the default hub implementation based on what multiplexing
-    libraries are installed. Tries libevent first, then poll, then select.
+    libraries are installed. Tries twistedr if a twisted reactor is
+    currently in use, then tries libevent, then poll, then select.
     """
+
+    if 'twisted.internet.reactor' in sys.modules:
+        from eventlet.hubs import twistedr
+        return twistedr
+
     try:
         import eventlet.hubs.libevent
         return eventlet.hubs.libevent
@@ -334,6 +383,8 @@ def use_hub(mod=None):
         mod = get_default_hub()
     if hasattr(_threadlocal, 'hub'):
         del _threadlocal.hub
+    if isinstance(mod, str):
+        mod = __import__('eventlet.hubs.' + mod, fromlist=['Hub'])
     if hasattr(mod, 'Hub'):
         _threadlocal.Hub = mod.Hub
     else:

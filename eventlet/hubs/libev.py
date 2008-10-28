@@ -33,7 +33,7 @@ from eventlet import greenlib
 from eventlet.timer import Timer
 from eventlet.hubs import hub
 
-import greenlet
+from eventlet.support import greenlet
 
 # XXX for debugging only
 #raise ImportError()
@@ -69,6 +69,7 @@ class Hub(hub.BaseHub):
             self.excs[fileno] = exc
 
         self.waiters_by_greenlet[greenlet.getcurrent()] = fileno
+        return fileno
 
     def remove_descriptor(self, fileno):
         for queue in (self.readers, self.writers):
