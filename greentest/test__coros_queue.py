@@ -1,12 +1,7 @@
 from greentest import LimitedTestCase
 from unittest import main
-from eventlet import api, coros
+from eventlet import api, coros, proc
 
-def waiting(queue):
-    try:
-        return len(queue.sem._waiters)
-    except AttributeError:
-        return len(queue.sem.lower_bound._waiters)
 
 class TestQueue(LimitedTestCase):
 
@@ -105,21 +100,6 @@ class TestQueue(LimitedTestCase):
         q.send(sendings[2])
         q.send(sendings[3])
         self.assertEquals(collect_pending_results(), 4)
-                
-    def test_ordering_of_waiters(self):
-        # test that waiters receive results in the order that they waited
-        q = coros.queue()
-        def waiter(q, evt):
-            evt.send(q.wait())
-
-        sendings = list(range(10))
-        evts = [coros.event() for x in sendings]
-        for i, x in enumerate(sendings):
-            api.spawn(waiter, q, evts[i])
-        results = []
-        for i, s in enumerate(sendings):
-            q.send(s)
-            self.assertEquals(s, evts[i].wait())
 
     def test_waiters_that_cancel(self):
         q = coros.queue()
@@ -189,7 +169,7 @@ class TestQueue(LimitedTestCase):
         self.assertEquals(e1.wait(), 'timed out')
         self.assertEquals(e2.wait(), 'timed out')
         self.assertEquals(q.wait(), 'sent')
-
+                
     def test_waiting(self):
         def do_wait(q, evt):
             result = q.wait()
@@ -199,12 +179,59 @@ class TestQueue(LimitedTestCase):
         e1 = coros.event()
         api.spawn(do_wait, q, e1)
         api.sleep(0)
-        self.assertEquals(1, waiting(q))
+        self.assertEquals(1, q.waiting())
         q.send('hi')
-        api.sleep(0)  # *FIX: should not be necessary
-        self.assertEquals(0, waiting(q))
+        api.sleep(0)
+        self.assertEquals(0, q.waiting())
         self.assertEquals('hi', e1.wait())
-        self.assertEquals(0, waiting(q))
+        self.assertEquals(0, q.waiting())
+
+
+class TestChannel(LimitedTestCase):
+
+    def test_send(self):
+        api.sleep(0.1)
+        channel = coros.queue(0)
+
+        events = []
+
+        def another_greenlet():
+            events.append(channel.wait())
+            events.append(channel.wait())
+
+        proc.spawn(another_greenlet)
+
+        events.append('sending')
+        channel.send('hello')
+        events.append('sent hello')
+        channel.send('world')
+        events.append('sent world')
+
+        self.assertEqual(['sending', 'hello', 'sent hello', 'world', 'sent world'], events)
+
+
+    def test_wait(self):
+        api.sleep(0.1)
+        channel = coros.queue(0)
+        events = []
+
+        def another_greenlet():
+            events.append('sending hello')
+            channel.send('hello')
+            events.append('sending world')
+            channel.send('world')
+            events.append('sent world')
+
+        proc.spawn(another_greenlet)
+
+        events.append('waiting')
+        events.append(channel.wait())
+        events.append(channel.wait())
+
+        self.assertEqual(['waiting', 'sending hello', 'hello', 'sending world', 'world'], events)
+        api.sleep(0)
+        self.assertEqual(['waiting', 'sending hello', 'hello', 'sending world', 'world', 'sent world'], events)
+
 
 if __name__=='__main__':
     main()

@@ -25,18 +25,17 @@ import os
 import sys
 import time
 import traceback
+
 from eventlet.green import urllib
 from eventlet.green import socket
 from eventlet.green import BaseHTTPServer
-
-from eventlet import api
 from eventlet.pool import Pool
 
 
 DEFAULT_MAX_SIMULTANEOUS_REQUESTS = 1024
-
-
 DEFAULT_MAX_HTTP_VERSION = 'HTTP/1.1'
+MAX_REQUEST_LINE = 8192
+MINIMUM_CHUNK_SIZE = 4096
 
 
 # Weekday and month names for HTTP date/time formatting; always English!
@@ -53,7 +52,8 @@ def format_date_time(timestamp):
 
 
 class Input(object):
-    def __init__(self, rfile, content_length, wfile=None, wfile_line=None):
+    def __init__(self, rfile, content_length, wfile=None, wfile_line=None,
+            chunked_input=False):
         self.rfile = rfile
         if content_length is not None:
             content_length = int(content_length)
@@ -63,6 +63,8 @@ class Input(object):
         self.wfile_line = wfile_line
 
         self.position = 0
+        self.chunked_input = chunked_input
+        self.chunk_length = -1
 
     def _do_read(self, reader, length=None):
         if self.wfile is not None:
@@ -81,7 +83,38 @@ class Input(object):
         self.position += len(read)
         return read
 
+    def _chunked_read(self, rfile, length=None):
+        if self.wfile is not None:
+            ## 100 Continue
+            self.wfile.write(self.wfile_line)
+            self.wfile = None
+            self.wfile_line = None
+
+        response = []
+        if length is None:
+            if self.chunk_length > self.position:
+                response.append(rfile.read(self.chunk_length - self.position))
+            while self.chunk_length != 0:
+                self.chunk_length = int(rfile.readline(), 16)
+                response.append(rfile.read(self.chunk_length))
+                rfile.readline()
+        else:
+            while length > 0 and self.chunk_length != 0:
+                if self.chunk_length > self.position:
+                    response.append(rfile.read(
+                            min(self.chunk_length - self.position, length)))
+                    length -= len(response[-1])
+                    self.position += len(response[-1])
+                    if self.chunk_length == self.position:
+                        rfile.readline()
+                else:
+                    self.chunk_length = int(rfile.readline(), 16)
+                    self.position = 0
+        return ''.join(response)
+
     def read(self, length=None):
+        if self.chunked_input:
+            return self._chunked_read(self.rfile, length)
         return self._do_read(self.rfile.read, length)
 
     def readline(self):
@@ -92,10 +125,6 @@ class Input(object):
 
     def __iter__(self):
         return iter(self.read())
-
-
-MAX_REQUEST_LINE = 8192
-MINIMUM_CHUNK_SIZE = 4096
 
 
 class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
@@ -152,9 +181,8 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
         header_dict = {}
 
         wfile = self.wfile
-        num_blocks = None
         result = None
-        use_chunked = False
+        use_chunked = [False]
         length = [0]
         status_code = [200]
 
@@ -174,17 +202,15 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
                 # send Date header?
                 if 'date' not in header_dict:
                     towrite.append('Date: %s\r\n' % (format_date_time(time.time()),))
-                if num_blocks is not None:
-                    if 'content-length' not in header_dict:
-                        towrite.append('Content-Length: %s\r\n' % (len(''.join(result)),))
-                elif use_chunked:
-                    towrite.append('Transfer-Encoding: chunked\r\n')
-                else:
+                if self.request_version == 'HTTP/1.0':
                     towrite.append('Connection: close\r\n')
                     self.close_connection = 1
+                elif 'content-length' not in header_dict:
+                    use_chunked[0] = True
+                    towrite.append('Transfer-Encoding: chunked\r\n')
                 towrite.append('\r\n')
 
-            if use_chunked:
+            if use_chunked[0]:
                 ## Write the chunked encoding
                 towrite.append("%x\r\n%s\r\n" % (len(data), data))
             else:
@@ -221,45 +247,25 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
             return write
 
         try:
-            result = self.application(self.environ, start_response)
-        except Exception, e:
-            exc = ''.join(traceback.format_exception(*sys.exc_info()))
-            print exc
-            if not headers_set:
-                start_response("500 Internal Server Error", [('Content-type', 'text/plain')])
-                write(exc)
-                return
-        try:
-            num_blocks = len(result)
-        except (TypeError, AttributeError, NotImplementedError):
-            if self.request_version == 'HTTP/1.1':
-                use_chunked = True
-        try:
             try:
+                result = self.application(self.environ, start_response)
+                if not headers_sent and hasattr(result, '__len__'):
+                    headers_set[1].append(('content-length', str(sum(map(len, result)))))
                 towrite = []
-                try:
-                    for data in result:
-                        if data:
-                            towrite.append(data)
-                            if use_chunked and sum(map(len, towrite)) > self.minimum_chunk_size:
-                                write(''.join(towrite))
-                                del towrite[:]
-                except Exception, e:
-                    exc = traceback.format_exc()
-                    print exc
-                    if not headers_set:
-                        start_response("500 Internal Server Error", [('Content-type', 'text/plain')])
-                        write(exc)
-                        return
-
-                if towrite:
-                    write(''.join(towrite))
+                for data in result:
+                    if data:
+                        write(data)
                 if not headers_sent:
                     write('')
-                if use_chunked:
+                if use_chunked[0]:
                     wfile.write('0\r\n\r\n')
             except Exception, e:
-                traceback.print_exc()
+                self.close_connection = 1
+                exc = traceback.format_exc()
+                print exc
+                if not headers_set:
+                    start_response("500 Internal Server Error", [('Content-type', 'text/plain')])
+                    write(exc)
         finally:
             if hasattr(result, 'close'):
                 result.close()
@@ -268,7 +274,7 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
                 self.environ['eventlet.input'].read()
             finish = time.time()
 
-            self.server.log_message('%s - - [%s] "%s" %s %s %.6f\n' % (
+            self.server.log_message('%s - - [%s] "%s" %s %s %.6f' % (
                 self.client_address[0],
                 self.log_date_time_string(),
                 self.requestline,
@@ -322,8 +328,10 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
         else:
             wfile = None
             wfile_line = None
+        chunked = env.get('HTTP_TRANSFER_ENCODING', '').lower() == 'chunked'
         env['wsgi.input'] = env['eventlet.input'] = Input(
-            self.rfile, length, wfile=wfile, wfile_line=wfile_line)
+            self.rfile, length, wfile=wfile, wfile_line=wfile_line,
+            chunked_input=chunked)
 
         return env
 
@@ -400,7 +408,6 @@ def server(sock, site, log=None, environ=None, max_size=None, max_http_version=D
                         raise
                 pool.execute_async(serv.process_request, client_socket)
             except KeyboardInterrupt:
-                api.get_hub().remove_descriptor(sock.fileno())
                 print "wsgi exiting"
                 break
     finally:
@@ -408,5 +415,5 @@ def server(sock, site, log=None, environ=None, max_size=None, max_http_version=D
             sock.close()
         except socket.error, e:
             if e[0] != errno.EPIPE:
-                raise
+                traceback.print_exc()
 

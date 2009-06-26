@@ -28,8 +28,9 @@ from eventlet import api
 
 class event_wrapper(object):
 
-    def __init__(self, impl):
+    def __init__(self, impl=None, seconds=None):
         self.impl = impl
+        self.seconds = seconds
 
     def __repr__(self):
         if self.impl is not None:
@@ -49,22 +50,9 @@ class event_wrapper(object):
             self.impl = None
 
 
-class LocalTimer(event_wrapper):
-
-    def __init__(self, cb, args, kwargs):
-        self.tpl =  cb, args, kwargs
-        self.greenlet = api.getcurrent()
-        # 'impl' attribute must be set to libevent's timeout instance
-
-    def __call__(self):
-        if self.greenlet:
-            cb, args, kwargs = self.tpl
-            cb(*args, **kwargs)
-
-
 class Hub(object):
 
-    SYSTEM_EXCEPTIONS = (KeyboardInterrupt, SystemExit, api.GreenletExit)
+    SYSTEM_EXCEPTIONS = (KeyboardInterrupt, SystemExit)
 
     def __init__(self, clock=time.time):
         event.init()
@@ -73,8 +61,9 @@ class Hub(object):
         self.writers = {}
         self.excs = {}
         self.greenlet = api.Greenlet(self.run)
-        self.exc_info = None
+        self.signal_exc_info = None
         self.signal(2, lambda signalnum, frame: self.greenlet.parent.throw(KeyboardInterrupt))
+        self.events_to_add = []
 
     def switch(self):
         cur = api.getcurrent()
@@ -92,28 +81,44 @@ class Hub(object):
         except ValueError:
             pass
         return self.greenlet.switch()
- 
+
+    def dispatch(self):
+        loop = event.loop
+        while True:
+            for e in self.events_to_add:
+                if e is not None and e.impl is not None and e.seconds is not None:
+                    e.impl.add(e.seconds)
+                    e.seconds = None
+            self.events_to_add = []
+            result = loop()
+
+            if getattr(event, '__event_exc', None) is not None:
+                # only have to do this because of bug in event.loop
+                t = getattr(event, '__event_exc')
+                setattr(event, '__event_exc', None)
+                assert getattr(event, '__event_exc') is None
+                raise t[0], t[1], t[2]
+
+            if result != 0:
+                return result
+
     def run(self):
         while True:
             try:
-                event.dispatch()
-                break
+                self.dispatch()
             except api.GreenletExit:
                 break
             except self.SYSTEM_EXCEPTIONS:
                 raise
             except:
-                if self.exc_info is not None:
-                    self.schedule_call_global(0, api.getcurrent().parent.throw, *self.exc_info)
-                    self.exc_info = None
+                if self.signal_exc_info is not None:
+                    self.schedule_call_global(0, api.getcurrent().parent.throw, *self.signal_exc_info)
+                    self.signal_exc_info = None
                 else:
                     traceback.print_exc()
 
     def abort(self):
-        # schedule an exception, because otherwise dispatch() will not exit if
-        # there are timeouts scheduled
         self.schedule_call_global(0, self.greenlet.throw, api.GreenletExit)
-        event.abort()
 
     @property
     def running(self):
@@ -122,11 +127,11 @@ class Hub(object):
     def add_descriptor(self, fileno, read=None, write=None, exc=None):
         if read:
             evt = event.read(fileno, read, fileno)
-            self.readers[fileno] = evt, read
+            self.readers[fileno] = evt
 
         if write:
             evt = event.write(fileno, write, fileno)
-            self.writers[fileno] = evt, write
+            self.writers[fileno] = evt
 
         if exc:
             self.excs[fileno] = exc
@@ -138,28 +143,41 @@ class Hub(object):
             try:
                 handler(signalnum, None)
             except:
-                self.exc_info = sys.exc_info()
+                self.signal_exc_info = sys.exc_info()
                 event.abort()
         return event_wrapper(event.signal(signalnum, wrapper))
 
     def remove_descriptor(self, fileno):
-        for queue in (self.readers, self.writers):
-            tpl = queue.pop(fileno, None)
-            if tpl is not None:
-                tpl[0].delete()
+        reader = self.readers.pop(fileno, None)
+        if reader is not None:
+            try:
+                reader.delete()
+            except:
+                traceback.print_exc()
+        writer = self.writers.pop(fileno, None)
+        if writer is not None:
+            try:
+                writer.delete()
+            except:
+                traceback.print_exc()
         self.excs.pop(fileno, None)
 
     def schedule_call_local(self, seconds, cb, *args, **kwargs):
-        timer = LocalTimer(cb, args, kwargs)
-        event_timeout = event.timeout(seconds, timer)
-        timer.impl = event_timeout
-        return timer
+        current = api.getcurrent()
+        if current is self.greenlet:
+            return self.schedule_call_global(seconds, cb, *args, **kwargs)
+        event_impl = event.event(_scheduled_call_local, (cb, args, kwargs, current))
+        wrapper = event_wrapper(event_impl, seconds=seconds)
+        self.events_to_add.append(wrapper)
+        return wrapper
 
     schedule_call = schedule_call_local
 
     def schedule_call_global(self, seconds, cb, *args, **kwargs):
-        event_timeout = event.timeout(seconds, lambda : cb(*args, **kwargs) and None)
-        return event_wrapper(event_timeout)
+        event_impl = event.event(_scheduled_call, (cb, args, kwargs))
+        wrapper = event_wrapper(event_impl, seconds=seconds)
+        self.events_to_add.append(wrapper)
+        return wrapper
 
     def exc_descriptor(self, fileno):
         exc = self.excs.get(fileno)
@@ -169,9 +187,6 @@ class Hub(object):
             except:
                 traceback.print_exc()
 
-    def timer_finished(self, t): pass
-    def timer_canceled(self, t): pass
-
     def get_readers(self):
         return self.readers
 
@@ -180,4 +195,33 @@ class Hub(object):
 
     def get_excs(self):
         return self.excs
+
+    def _version_info(self):
+        baseversion = event.__version__
+        try:
+            from ctypes import CDLL, util, c_char_p
+            c = CDLL(util.find_library('event'))
+            c.event_get_version.restype = c_char_p
+            baseversion += '/libevent=%s' % (c.event_get_version(), )
+            c.event_get_method.restype = c_char_p
+            baseversion += '/method=%s' % (c.event_get_method(), )
+        except Exception, ex:
+            print ex or type(ex).__name__
+        return baseversion
+
+
+def _scheduled_call(event_impl, handle, evtype, arg):
+    cb, args, kwargs = arg
+    try:
+        cb(*args, **kwargs)
+    finally:
+        event_impl.delete()
+
+def _scheduled_call_local(event_impl, handle, evtype, arg):
+    cb, args, kwargs, caller_greenlet = arg
+    try:
+        if not caller_greenlet.dead:
+            cb(*args, **kwargs)
+    finally:
+        event_impl.delete()
 

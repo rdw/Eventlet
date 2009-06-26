@@ -95,7 +95,7 @@ class Pool(object):
             self.current_size -= 1
             return
 
-        if self.channel.sem.balance < 0:
+        if self.waiting():
             self.channel.send(item)
         else:
             if self.order_as_stack:
@@ -116,10 +116,8 @@ class Pool(object):
     def waiting(self):
         """Return the number of routines waiting for a pool item.
         """
-        if self.channel.sem.balance < 0:
-            return -self.channel.sem.balance
-        return 0
-
+        return self.channel.waiting()
+  
     def create(self):
         """Generate a new pool item
         """
@@ -207,6 +205,3 @@ class ExceptionWrapper(object):
     def __init__(self, e):
         self.e = e
 
-if __name__=='__main__':
-    import doctest
-    doctest.testmod()

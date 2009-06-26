@@ -103,6 +103,11 @@ class LinkedExited(Exception):
             msg = self.msg % self.name
         Exception.__init__(self, msg)
 
+class LinkedCompleted(LinkedExited):
+    """Raised when a linked proc finishes the execution cleanly"""
+
+    msg = "%r completed successfully"
+
 class LinkedFailed(LinkedExited):
     """Raised when a linked proc dies because of unhandled exception"""
     msg = "%r failed with %s"
@@ -110,11 +115,6 @@ class LinkedFailed(LinkedExited):
     def __init__(self, name, typ, value=None, tb=None):
         msg = self.msg % (name, typ.__name__)
         LinkedExited.__init__(self, name, msg)
-
-class LinkedCompleted(LinkedExited):
-    """Raised when a linked proc finishes the execution cleanly"""
-
-    msg = "%r completed successfully"
 
 class LinkedKilled(LinkedFailed):
     """Raised when a linked proc dies because of unhandled GreenletExit
@@ -624,7 +624,10 @@ def spawn_link_exception(function, *args, **kwargs):
 
 
 def trap_errors(errors, func, *args, **kwargs):
-    """DEPRECATED in favor of wrap_errors"""
+    """DEPRECATED; use wrap_errors"""
+    import warnings
+    warnings.warn("proc.trap_errors function is deprecated in favor of proc.wrap_errors class",
+                  DeprecationWarning, stacklevel=2)
     try:
         return func(*args, **kwargs)
     except errors, ex:
@@ -730,7 +733,3 @@ class Pool(object):
         g.link(lambda *_args: self.semaphore.release())
         return g
 
-
-if __name__=='__main__':
-    import doctest
-    doctest.testmod()

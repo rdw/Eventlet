@@ -1,5 +1,5 @@
 # @author Donovan Preston
-# 
+#
 # Copyright (c) 2007, Linden Research, Inc.
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -7,10 +7,10 @@
 # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
-# 
+#
 # The above copyright notice and this permission notice shall be included in
 # all copies or substantial portions of the Software.
-# 
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -21,6 +21,7 @@
 
 import collections
 import time
+import traceback
 
 from eventlet import api
 
@@ -56,7 +57,7 @@ class event(object):
     """
     _result = None
     def __init__(self):
-        self._waiters = {}
+        self._waiters = set()
         self.reset()
 
     def __str__(self):
@@ -145,11 +146,11 @@ class event(object):
         'result'
         """
         if self._result is NOT_USED:
-            self._waiters[api.getcurrent()] = True
+            self._waiters.add(api.getcurrent())
             try:
                 return api.get_hub().switch()
             finally:
-                self._waiters.pop(api.getcurrent(), None)
+                self._waiters.discard(api.getcurrent())
         if self._exc is not None:
             api.getcurrent().throw(*self._exc)
         return self._result
@@ -187,7 +188,7 @@ class event(object):
         self._exc = exc
         hub = api.get_hub()
         if self._waiters:
-            hub.schedule_call_global(0, self._do_send, self._result, self._exc, self._waiters.keys())
+            hub.schedule_call_global(0, self._do_send, self._result, self._exc, self._waiters.copy())
 
     def _do_send(self, result, exc, waiters):
         while waiters:
@@ -212,12 +213,15 @@ class Semaphore(object):
 
     def __init__(self, count=0):
         self.counter  = count
-        self._order = collections.deque()
-        self._waiters = {}
+        self._waiters = set()
+
+    def __repr__(self):
+        params = (self.__class__.__name__, hex(id(self)), self.counter, len(self._waiters))
+        return '<%s at %s c=%s _w[%s]>' % params
 
     def __str__(self):
-        params = (self.__class__.__name__, hex(id(self)), self.counter)
-        return '<%s at %s counter=%r>' % params
+        params = (self.__class__.__name__, self.counter, len(self._waiters))
+        return '<%s c=%s _w[%s]>' % params
 
     def locked(self):
         return self.counter <= 0
@@ -229,13 +233,13 @@ class Semaphore(object):
     def acquire(self, blocking=True):
         if not blocking and self.locked():
             return False
-        while self.counter<=0:
-            self._waiters[api.getcurrent()] = None
-            self._order.append(api.getcurrent())
+        if self.counter <= 0:
+            self._waiters.add(api.getcurrent())
             try:
-                api.get_hub().switch()
+                while self.counter <= 0:
+                    api.get_hub().switch()
             finally:
-                self._waiters.pop(api.getcurrent(), None)
+                self._waiters.discard(api.getcurrent())
         self.counter -= 1
         return True
 
@@ -245,24 +249,24 @@ class Semaphore(object):
     def release(self, blocking=True):
         # `blocking' parameter is for consistency with BoundedSemaphore and is ignored
         self.counter += 1
-        if self._waiters or self._order:
+        if self._waiters:
             api.get_hub().schedule_call_global(0, self._do_acquire)
         return True
 
     def _do_acquire(self):
-        if (self._waiters or self._order) and self.counter>0:
-            waiter = None
-            while not waiter and self._order:
-                waiter = self._order.popleft()
-                if waiter not in self._waiters:
-                    waiter = None
-
-            if waiter is not None:
-                self._waiters.pop(waiter)
-                waiter.switch()
+        if self._waiters and self.counter>0:
+            waiter = self._waiters.pop()
+            waiter.switch()
 
     def __exit__(self, typ, val, tb):
         self.release()
+
+    @property
+    def balance(self):
+        # positive means there are free items
+        # zero means there are no free items but nobody has requested one
+        # negative means there are requests for items, but no items
+        return self.counter - len(self._waiters)
 
 
 class BoundedSemaphore(object):
@@ -280,9 +284,13 @@ class BoundedSemaphore(object):
         self.lower_bound = Semaphore(count)
         self.upper_bound = Semaphore(limit-count)
 
+    def __repr__(self):
+        params = (self.__class__.__name__, hex(id(self)), self.balance, self.lower_bound, self.upper_bound)
+        return '<%s at %s b=%s l=%s u=%s>' % params
+
     def __str__(self):
-        params = (self.__class__.__name__, hex(id(self)), self.lower_bound.counter, self.upper_bound.counter)
-        return '<%s at %s %r/%r>' % params
+        params = (self.__class__.__name__, self.balance, self.lower_bound, self.upper_bound)
+        return '<%s b=%s l=%s u=%s>' % params
 
     def locked(self):
         return self.lower_bound.locked()
@@ -321,7 +329,7 @@ class BoundedSemaphore(object):
 
     @property
     def balance(self):
-        return self.lower_bound.counter - self.upper_bound.counter
+        return self.lower_bound.balance - self.upper_bound.balance
 
 
 def semaphore(count=0, limit=None):
@@ -412,43 +420,11 @@ def CoroutinePool(*args, **kwargs):
     return Pool(*args, **kwargs)
 
 
-class queue(object):
-    """Cross-coroutine queue, using semaphore to synchronize.
-    The API is like a generalization of event to be able to hold more than one
-    item at a time (without reset() or cancel()).
+class Queue(object):
 
-    >>> from eventlet import coros
-    >>> q = coros.queue(max_size=2)
-    >>> def putter(q):
-    ...     q.send("first")
-    ...
-    >>> _ = api.spawn(putter, q)
-    >>> q.ready()
-    False
-    >>> q.wait()
-    'first'
-    >>> q.ready()
-    False
-    >>> q.send("second")
-    >>> q.ready()
-    True
-    >>> q.send("third")
-    >>> def getter(q):
-    ...     print q.wait()
-    ...
-    >>> _ = api.spawn(getter, q)
-    >>> q.send("fourth")
-    second
-    """
-    def __init__(self, max_size=None):
-        """If you omit max_size, the queue will attempt to store an unlimited
-        number of items.
-        Specifying max_size means that when the queue already contains
-        max_size items, an attempt to send() one more item will suspend the
-        calling coroutine until someone else retrieves one.
-        """
+    def __init__(self):
         self.items = collections.deque()
-        self.sem = semaphore(count=0, limit=max_size)
+        self._waiters = set()
 
     def __nonzero__(self):
         return len(self.items)>0
@@ -456,40 +432,155 @@ class queue(object):
     def __len__(self):
         return len(self.items)
 
-    def __str__(self):
-        params = (self.__class__.__name__, hex(id(self)), self.sem, len(self.items))
-        return '<%s at %s sem=%s items[%d]>' % params
+    def __repr__(self):
+        params = (self.__class__.__name__, hex(id(self)), len(self.items), len(self._waiters))
+        return '<%s at %s items[%d] _waiters[%s]>' % params
 
     def send(self, result=None, exc=None):
-        """If you send(exc=SomeExceptionClass), the corresponding wait() call
-        will raise that exception.
-        Otherwise, the corresponding wait() will return result (default None).
-        """
         if exc is not None and not isinstance(exc, tuple):
             exc = (exc, )
         self.items.append((result, exc))
-        self.sem.release()
+        if self._waiters:
+            api.get_hub().schedule_call_global(0, self._do_send)
 
     def send_exception(self, *args):
         # the arguments are the same as for greenlet.throw
         return self.send(exc=args)
 
+    def _do_send(self):
+        if self._waiters and self.items:
+            waiter = self._waiters.pop()
+            result, exc = self.items.popleft()
+            waiter.switch((result, exc))
+
     def wait(self):
-        """Wait for an item sent by a send() call, in FIFO order.
-        If the corresponding send() specifies exc=SomeExceptionClass, this
-        wait() will raise that exception.
-        Otherwise, this wait() will return the corresponding send() call's
-        result= parameter.
-        """
-        self.sem.acquire()
-        result, exc = self.items.popleft()
-        if exc is not None:
-            api.getcurrent().throw(*exc)
-        return result
+        if self.items:
+            result, exc = self.items.popleft()
+            if exc is None:
+                return result
+            else:
+                api.getcurrent().throw(*exc)
+        else:
+            self._waiters.add(api.getcurrent())
+            try:
+                result, exc = api.get_hub().switch()
+                if exc is None:
+                    return result
+                else:
+                    api.getcurrent().throw(*exc)
+            finally:
+                self._waiters.discard(api.getcurrent())
 
     def ready(self):
-        # could also base this on self.sem.counter...
         return len(self.items) > 0
+
+    def full(self):
+        # for consistency with Channel
+        return False
+
+    def waiting(self):
+        return len(self._waiters)
+
+
+class Channel(object):
+
+    def __init__(self, max_size=0):
+        self.max_size = max_size
+        self.items = collections.deque()
+        self._waiters = set()
+        self._senders = set()
+
+    def __nonzero__(self):
+        return len(self.items)>0
+
+    def __len__(self):
+        return len(self.items)
+
+    def __repr__(self):
+        params = (self.__class__.__name__, hex(id(self)), self.max_size, len(self.items), len(self._waiters), len(self._senders))
+        return '<%s at %s max=%s items[%d] _w[%s] _s[%s]>' % params
+
+    def send(self, result=None, exc=None):
+        if exc is not None and not isinstance(exc, tuple):
+            exc = (exc, )
+        if api.getcurrent() is api.get_hub().greenlet:
+            self.items.append((result, exc))
+            if self._waiters:
+                api.get_hub().schedule_call_global(0, self._do_switch)
+        else:
+            if self._waiters and self._senders:
+                api.sleep(0)
+            self.items.append((result, exc))
+            # note that send() does not work well with timeouts. if your timeout fires
+            # after this point, the item will remain in the queue
+            if self._waiters:
+                api.get_hub().schedule_call_global(0, self._do_switch)
+            if len(self.items) > self.max_size:
+                self._senders.add(api.getcurrent())
+                try:
+                    api.get_hub().switch()
+                finally:
+                    self._senders.discard(api.getcurrent())
+
+    def send_exception(self, *args):
+        # the arguments are the same as for greenlet.throw
+        return self.send(exc=args)
+
+    def _do_switch(self):
+        while True:
+            if self._waiters and self.items:
+                waiter = self._waiters.pop()
+                result, exc = self.items.popleft()
+                try:
+                    waiter.switch((result, exc))
+                except:
+                    traceback.print_exc()
+            elif self._senders and len(self.items) <= self.max_size:
+                sender = self._senders.pop()
+                try:
+                    sender.switch()
+                except:
+                    traceback.print_exc()
+            else:
+                break
+
+    def wait(self):
+        if self.items:
+            result, exc = self.items.popleft()
+            if len(self.items) <= self.max_size:
+                api.get_hub().schedule_call_global(0, self._do_switch)
+            if exc is None:
+                return result
+            else:
+                api.getcurrent().throw(*exc)
+        else:
+            if self._senders:
+                api.get_hub().schedule_call_global(0, self._do_switch)
+            self._waiters.add(api.getcurrent())
+            try:
+                result, exc = api.get_hub().switch()
+                if exc is None:
+                    return result
+                else:
+                    api.getcurrent().throw(*exc)
+            finally:
+                self._waiters.discard(api.getcurrent())
+
+    def ready(self):
+        return len(self.items) > 0
+
+    def full(self):
+        return len(self.items) >= self.max_size
+
+    def waiting(self):
+        return max(0, len(self._waiters) - len(self.items))
+
+
+def queue(max_size=None):
+    if max_size is None:
+        return Queue()
+    else:
+        return Channel(max_size)
 
 
 class Actor(object):
@@ -576,11 +667,3 @@ class Actor(object):
         """
         raise NotImplementedError()
 
-
-def _test():
-    print "Running doctests.  There will be no further output if they succeed."
-    import doctest
-    doctest.testmod()
-
-if __name__ == "__main__":
-    _test()
