@@ -1,24 +1,3 @@
-# @author Donovan Preston, Aaron Brashears
-# 
-# Copyright (c) 2007, Linden Research, Inc.
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-# 
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-# 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
-
 import collections
 
 from eventlet import api
@@ -90,7 +69,31 @@ class Pool(object):
             self.current_size += 1
             return created
         return self.channel.wait()
-    
+
+    try:
+        from contextlib import contextmanager
+        @contextmanager
+        def item(self):
+            """ Get an object out of the pool, for use with with statement. 
+
+            >>> from eventlet import pools
+            >>> pool = pools.TokenPool(max_size=4)
+            >>> with pool.item() as obj:
+            ...     print "got token"
+            ...
+            got token
+            >>> pool.free()
+            4
+            """
+            obj = self.get()
+            try:
+                yield obj
+            finally:
+                self.put(obj)
+    except ImportError:
+        pass
+
+
     def put(self, item):
         """Put an item back into the pool, when done
         """
@@ -139,8 +142,4 @@ class TokenPool(Pool):
     def create(self):
         return Token()
         
-
-class ExceptionWrapper(object):
-    def __init__(self, e):
-        self.e = e
 
