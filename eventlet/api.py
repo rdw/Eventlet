@@ -4,6 +4,7 @@ import socket
 import string
 import linecache
 import inspect
+import warnings
 
 from eventlet.support import greenlets as greenlet
 from eventlet.hubs import get_hub as get_hub_, get_default_hub as get_default_hub_, use_hub as use_hub_
@@ -14,8 +15,6 @@ __all__ = [
     'ssl_listener', 'tcp_listener', 'trampoline',
     'unspew', 'use_hub', 'with_timeout', 'timeout']
 
-
-import warnings
 def get_hub(*a, **kw):
     warnings.warn("eventlet.api.get_hub has moved to eventlet.hubs.get_hub",
         DeprecationWarning, stacklevel=2)
@@ -119,86 +118,21 @@ def trampoline(fd, read=None, write=None, timeout=None, timeout_exc=TimeoutError
             t.cancel()
 
 
-def _spawn_startup(cb, args, kw, cancel=None):
-    try:
-        greenlet.getcurrent().parent.switch()
-        cancel = None
-    finally:
-        if cancel is not None:
-            cancel()
-    return cb(*args, **kw)
+from eventlet import greenthread
+spawn = greenthread.spawn
+spawn_n = greenthread.spawn_n
 
-def _spawn(g):
-    g.parent = greenlet.getcurrent()
-    g.switch()
-
-
-def spawn(function, *args, **kwds):
-    """Create a new coroutine, or cooperative thread of control, within which
-    to execute *function*.
-
-    The *function* will be called with the given *args* and keyword arguments
-    *kwds* and will remain in control unless it cooperatively yields by
-    calling a socket method or ``sleep()``.
-
-    :func:`spawn` returns control to the caller immediately, and *function*
-    will be called in a future main loop iteration.
-
-    An uncaught exception in *function* or any child will terminate the new
-    coroutine with a log message.
-    """
-    # killable
-    t = None
-    g = Greenlet(_spawn_startup)
-    t = get_hub_().schedule_call_global(0, _spawn, g)
-    g.switch(function, args, kwds, t.cancel)
-    return g
 
 def kill(g, *throw_args):
     get_hub_().schedule_call_global(0, g.throw, *throw_args)
     if getcurrent() is not get_hub_().greenlet:
         sleep(0)
 
-def call_after_global(seconds, function, *args, **kwds):
-    """Schedule *function* to be called after *seconds* have elapsed.
-    The function will be scheduled even if the current greenlet has exited.
 
-    *seconds* may be specified as an integer, or a float if fractional seconds
-    are desired. The *function* will be called with the given *args* and
-    keyword arguments *kwds*, and will be executed within the main loop's
-    coroutine.
+call_after = greenthread.call_after
+call_after_local = greenthread.call_after_local
+call_after_global = greenthread.call_after_global
 
-    Its return value is discarded. Any uncaught exception will be logged.
-    """
-    # cancellable
-    def startup():
-        g = Greenlet(_spawn_startup)
-        g.switch(function, args, kwds)
-        g.switch()
-    t = get_hub_().schedule_call_global(seconds, startup)
-    return t
-
-def call_after_local(seconds, function, *args, **kwds):
-    """Schedule *function* to be called after *seconds* have elapsed.
-    The function will NOT be called if the current greenlet has exited.
-
-    *seconds* may be specified as an integer, or a float if fractional seconds
-    are desired. The *function* will be called with the given *args* and
-    keyword arguments *kwds*, and will be executed within the main loop's
-    coroutine.
-
-    Its return value is discarded. Any uncaught exception will be logged.
-    """
-    # cancellable
-    def startup():
-        g = Greenlet(_spawn_startup)
-        g.switch(function, args, kwds)
-        g.switch()
-    t = get_hub_().schedule_call_local(seconds, startup)
-    return t
-
-# for compatibility with original eventlet API
-call_after = call_after_local
 
 class _SilentException:
     pass
@@ -325,26 +259,9 @@ def exc_after(seconds, *throw_args):
                 timer.cancel()
     """
     return call_after(seconds, getcurrent().throw, *throw_args)
-
-def sleep(seconds=0):
-    """Yield control to another eligible coroutine until at least *seconds* have
-    elapsed.
-
-    *seconds* may be specified as an integer, or a float if fractional seconds
-    are desired. Calling :func:`~eventlet.api.sleep` with *seconds* of 0 is the
-    canonical way of expressing a cooperative yield. For example, if one is
-    looping over a large list performing an expensive calculation without
-    calling any socket methods, it's a good idea to call ``sleep(0)``
-    occasionally; otherwise nothing else will run.
-    """
-    hub = get_hub_()
-    assert hub.greenlet is not greenlet.getcurrent(), 'do not call blocking functions from the mainloop'
-    timer = hub.schedule_call_global(seconds, greenlet.getcurrent().switch)
-    try:
-        hub.switch()
-    finally:
-        timer.cancel()
-
+    
+    
+sleep = greenthread.sleep
 
 getcurrent = greenlet.getcurrent
 GreenletExit = greenlet.GreenletExit
