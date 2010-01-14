@@ -109,6 +109,7 @@ def read_http(sock):
         if not x:
             continue
         key, value = x.split(': ', 1)
+        assert key.lower() not in headers, "%s header duplicated" % key
         headers[key.lower()] = value
 
     if CONTENT_LENGTH in headers:
@@ -116,10 +117,10 @@ def read_http(sock):
         body = fd.read(num)
         #print body
     else:
-        body = None
+        # read until EOF
+        body = fd.read()
 
     return response_line, headers, body
-
 
 class TestHttpd(LimitedTestCase):
     mode = 'static'
@@ -689,6 +690,31 @@ class TestHttpd(LimitedTestCase):
         sock.close()
         self.assert_('\nHI GET /yo! HTTP/1.1 HI\n' in self.logfile.getvalue(), self.logfile.getvalue())
 
+    def test_close_chunked_with_1_0_client(self):
+        # verify that if we return a generator from our app
+        # and we're not speaking with a 1.1 client, that we 
+        # close the connection
+        self.site.application = chunked_app
+        sock = api.connect_tcp(('localhost', self.port))
+
+        sock.sendall('GET / HTTP/1.0\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n')
         
+        response_line, headers, body = read_http(sock)
+        self.assertEqual(headers['connection'], 'close')
+        self.assertNotEqual(headers.get('transfer-encoding'), 'chunked')
+        self.assertEquals(body, "thisischunked")
+        
+    def test_026_http_10_nokeepalive(self):
+        # verify that if an http/1.0 client sends connection: keep-alive
+        # and the server doesn't accept keep-alives, we close the connection
+        self.spawn_server(keepalive=False)
+        sock = api.connect_tcp(
+            ('localhost', self.port))
+
+        sock.sendall('GET / HTTP/1.0\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n')
+        response_line, headers, body = read_http(sock)
+        self.assertEqual(headers['connection'], 'close')
+
+
 if __name__ == '__main__':
     main()

@@ -37,6 +37,15 @@ def format_date_time(timestamp):
 BAD_SOCK = set((errno.EBADF, 10053))
 BROKEN_SOCK = set((errno.EPIPE, errno.ECONNRESET))
 
+def get_errno(err):
+    """ Simple method to get the error code out of socket.error objects.  It 
+    compensates for some cases where the code is not in the expected 
+    location."""
+    try:
+        return err[0]
+    except IndexError:
+        return None
+
 class Input(object):
     def __init__(self, 
                  rfile, 
@@ -162,7 +171,7 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
         except greenio.SSL.ZeroReturnError:
             self.raw_requestline = ''
         except socket.error, e:
-            if e[0] not in BAD_SOCK:
+            if get_errno(e) not in BAD_SOCK:
                 raise
             self.raw_requestline = ''
 
@@ -192,7 +201,7 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
                 self.handle_one_response()
             except socket.error, e:
                 # Broken pipe, connection reset by peer
-                if e[0] not in BROKEN_SOCK:
+                if get_errno(e) not in BROKEN_SOCK:
                     raise
         finally:
             self.server.outstanding_requests -= 1
@@ -223,17 +232,32 @@ class HttpProtocol(BaseHTTPServer.BaseHTTPRequestHandler):
                 # send Date header?
                 if 'date' not in header_list:
                     towrite.append('Date: %s\r\n' % (format_date_time(time.time()),))
-                if self.request_version == 'HTTP/1.0':
-                    if self.headers.get('Connection', "").lower() == 'keep-alive':
-                        towrite.append('Connection: keep-alive\r\n')
+
+                client_conn = self.headers.get('Connection', '').lower()
+                send_keep_alive = False
+                if self.server.keepalive and (client_conn == 'keep-alive' or \
+                    (self.request_version == 'HTTP/1.1' and
+                     not client_conn == 'close')):
+                        # only send keep-alives back to clients that sent them,
+                        # it's redundant for 1.1 connections
+                        send_keep_alive = (client_conn == 'keep-alive')
                         self.close_connection = 0
-                    else:
-                        towrite.append('Connection: close\r\n')
-                        self.close_connection = 1
-                elif 'content-length' not in header_list:
+                else:
+                    self.close_connection = 1
+
+                if self.request_version == 'HTTP/1.1' and 'content-length' not in header_list :
                     use_chunked[0] = True
                     towrite.append('Transfer-Encoding: chunked\r\n')
+                elif 'content-length' not in header_list:
+                    # client is 1.0 and therefore must read to EOF
+                    self.close_connection = 1
+
+                if self.close_connection:
+                    towrite.append('Connection: close\r\n')
+                elif send_keep_alive:
+                    towrite.append('Connection: keep-alive\r\n') 
                 towrite.append('\r\n')
+                # end of header writing
 
             if use_chunked[0]:
                 ## Write the chunked encoding
@@ -393,6 +417,7 @@ class Server(BaseHTTPServer.HTTPServer):
                  protocol=HttpProtocol, 
                  minimum_chunk_size=None,
                  log_x_forwarded_for=True,
+                 keepalive=True,
                  log_format=DEFAULT_LOG_FORMAT):
         
         self.outstanding_requests = 0
@@ -403,6 +428,7 @@ class Server(BaseHTTPServer.HTTPServer):
         else:
             self.log = sys.stderr
         self.app = app
+        self.keepalive = keepalive
         self.environ = environ
         self.max_http_version = max_http_version
         self.protocol = protocol
@@ -445,6 +471,7 @@ def server(sock, site,
            minimum_chunk_size=None,
            log_x_forwarded_for=True,
            custom_pool=None,
+           keepalive=True,
            log_format=DEFAULT_LOG_FORMAT):
     """  Start up a wsgi server handling requests from the supplied server 
     socket.  This function loops forever.  The *sock* object will be closed after server exits,
@@ -462,7 +489,7 @@ def server(sock, site,
     :param minimum_chunk_size: Minimum size in bytes for http chunks.  This  can be used to improve performance of applications which yield many small strings, though using it technically violates the WSGI spec.
     :param log_x_forwarded_for: If True (the default), logs the contents of the x-forwarded-for header in addition to the actual client ip address in the 'client_ip' field of the log line.
     :param custom_pool: A custom Pool instance which is used to spawn client green threads.  If this is supplied, max_size is ignored.
-    :param log_formar: A python format string that is used as the template to generate log lines.  The following values can be formatted into it: client_ip, date_time, request_line, status_code, body_length, wall_seconds.  Look the default for an example of how to use this.
+    :param log_format: A python format string that is used as the template to generate log lines.  The following values can be formatted into it: client_ip, date_time, request_line, status_code, body_length, wall_seconds.  Look the default for an example of how to use this.
     """
     serv = Server(sock, sock.getsockname(), 
                   site, log, 
@@ -471,6 +498,7 @@ def server(sock, site,
                   protocol=protocol, 
                   minimum_chunk_size=minimum_chunk_size,
                   log_x_forwarded_for=log_x_forwarded_for,
+                  keepalive=keepalive,
                   log_format=log_format)
     if server_event is not None:
         server_event.send(serv)
@@ -498,7 +526,7 @@ def server(sock, site,
                 try:
                     client_socket = sock.accept()
                 except socket.error, e:
-                    if e[0] not in ACCEPT_SOCK:
+                    if get_errno(e) not in ACCEPT_SOCK:
                         raise
                 pool.execute_async(serv.process_request, client_socket)
             except (KeyboardInterrupt, SystemExit):
@@ -513,6 +541,6 @@ def server(sock, site,
             # all.
             sock.close()
         except socket.error, e:
-            if e[0] not in BROKEN_SOCK:
+            if get_errno(e) not in BROKEN_SOCK:
                 traceback.print_exc()
 
