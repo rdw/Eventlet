@@ -14,6 +14,7 @@ from eventlet import greenio
 from eventlet.green import socket as greensocket
 from eventlet import wsgi
 from eventlet import processes
+from eventlet.common import get_errno
 
 from tests import find_command
 
@@ -95,7 +96,7 @@ def read_http(sock):
     try:
         response_line = fd.readline()
     except socket.error, exc:
-        if exc[0] == 10053:
+        if get_errno(exc) == 10053:
             raise ConnectionClosed
         raise
     if not response_line:
@@ -166,7 +167,7 @@ class TestHttpd(LimitedTestCase):
         sock = eventlet.connect(
             ('localhost', self.port))
 
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET / HTTP/1.0\r\nHost: localhost\r\n\r\n')
         fd.flush()
         result = fd.read()
@@ -179,7 +180,7 @@ class TestHttpd(LimitedTestCase):
         sock = eventlet.connect(
             ('localhost', self.port))
 
-        fd = sock.makefile()
+        fd = sock.makefile('w')
         fd.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
         fd.flush()
         read_http(sock)
@@ -193,7 +194,7 @@ class TestHttpd(LimitedTestCase):
         sock = eventlet.connect(
             ('localhost', self.port))
 
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
         fd.flush()
         cancel = eventlet.Timeout(1, RuntimeError)
@@ -205,7 +206,7 @@ class TestHttpd(LimitedTestCase):
         sock = eventlet.connect(
             ('localhost', self.port))
 
-        fd = sock.makefile()
+        fd = sock.makefile('w')
         fd.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
         fd.flush()
         read_http(sock)
@@ -233,7 +234,7 @@ class TestHttpd(LimitedTestCase):
             path_parts.append('path')
         path = '/'.join(path_parts)
         request = 'GET /%s HTTP/1.0\r\nHost: localhost\r\n\r\n' % path
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write(request)
         fd.flush()
         result = fd.readline()
@@ -260,7 +261,7 @@ class TestHttpd(LimitedTestCase):
             'Content-Length: 3',
             '',
             'a=a'))
-        fd = sock.makefile()
+        fd = sock.makefile('w')
         fd.write(request)
         fd.flush()
 
@@ -274,7 +275,7 @@ class TestHttpd(LimitedTestCase):
         sock = eventlet.connect(
             ('localhost', self.port))
 
-        fd = sock.makefile()
+        fd = sock.makefile('w')
         fd.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
         fd.flush()
         response_line_200,_,_ = read_http(sock)
@@ -292,7 +293,7 @@ class TestHttpd(LimitedTestCase):
         sock = eventlet.connect(
             ('localhost', self.port))
 
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
         fd.flush()
         self.assert_('Transfer-Encoding: chunked' in fd.read())
@@ -302,7 +303,7 @@ class TestHttpd(LimitedTestCase):
         sock = eventlet.connect(
             ('localhost', self.port))
 
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n')
         fd.flush()
         self.assert_('Transfer-Encoding: chunked' not in fd.read())
@@ -312,7 +313,7 @@ class TestHttpd(LimitedTestCase):
         sock = eventlet.connect(
             ('localhost', self.port))
 
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
         fd.flush()
         headers = ''
@@ -371,7 +372,7 @@ class TestHttpd(LimitedTestCase):
     def test_014_chunked_post(self):
         self.site.application = chunked_post
         sock = eventlet.connect(('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('PUT /a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n'
                  'Transfer-Encoding: chunked\r\n\r\n'
                  '2\r\noh\r\n4\r\n hai\r\n0\r\n\r\n')
@@ -383,7 +384,7 @@ class TestHttpd(LimitedTestCase):
         self.assert_(response == 'oh hai', 'invalid response %s' % response)
 
         sock = eventlet.connect(('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('PUT /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n'
                  'Transfer-Encoding: chunked\r\n\r\n'
                  '2\r\noh\r\n4\r\n hai\r\n0\r\n\r\n')
@@ -395,7 +396,7 @@ class TestHttpd(LimitedTestCase):
         self.assert_(response == 'oh hai', 'invalid response %s' % response)
 
         sock = eventlet.connect(('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('PUT /c HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n'
                  'Transfer-Encoding: chunked\r\n\r\n'
                  '2\r\noh\r\n4\r\n hai\r\n0\r\n\r\n')
@@ -409,14 +410,14 @@ class TestHttpd(LimitedTestCase):
     def test_015_write(self):
         self.site.application = use_write
         sock = eventlet.connect(('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('w')
         fd.write('GET /a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
         fd.flush()
         response_line, headers, body = read_http(sock)
         self.assert_('content-length' in headers)
 
         sock = eventlet.connect(('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('w')
         fd.write('GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
         fd.flush()
         response_line, headers, body = read_http(sock)
@@ -433,7 +434,7 @@ class TestHttpd(LimitedTestCase):
             return ['testing']
         self.site.application = wsgi_app
         sock = eventlet.connect(('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET /a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
         fd.flush()
         header_lines = []
@@ -485,7 +486,7 @@ class TestHttpd(LimitedTestCase):
         sock = eventlet.connect(
             ('localhost', self.port))
 
-        fd = sock.makefile()
+        fd = sock.makefile('w')
         fd.write('GET / HTTP/1.0\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n')
         fd.flush()
         
@@ -511,7 +512,7 @@ class TestHttpd(LimitedTestCase):
         sock = eventlet.connect(
             ('localhost', self.port))
 
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('POST / HTTP/1.1\r\n'
                  'Host: localhost\r\n'
                  'Connection: close\r\n'
@@ -547,7 +548,7 @@ class TestHttpd(LimitedTestCase):
         self.spawn_server(sock=server_sock_2)
         # do a single req/response to verify it's up
         sock = eventlet.connect(('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET / HTTP/1.0\r\nHost: localhost\r\n\r\n')
         fd.flush()
         result = fd.read(1024)
@@ -563,10 +564,10 @@ class TestHttpd(LimitedTestCase):
             server_sock_2.accept()
             # shouldn't be able to use this one anymore
         except socket.error, exc:
-            self.assertEqual(exc[0], errno.EBADF)
+            self.assertEqual(get_errno(exc), errno.EBADF)
         self.spawn_server(sock=server_sock)
         sock = eventlet.connect(('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET / HTTP/1.0\r\nHost: localhost\r\n\r\n')
         fd.flush()
         result = fd.read(1024)
@@ -587,7 +588,7 @@ class TestHttpd(LimitedTestCase):
             return []
         self.site.application = clobberin_time
         sock = eventlet.connect(('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET / HTTP/1.1\r\n'
                  'Host: localhost\r\n'
                  'Connection: close\r\n'
@@ -606,7 +607,7 @@ class TestHttpd(LimitedTestCase):
         # this stuff is copied from test_001_server, could be better factored
         sock = eventlet.connect(
             ('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET / HTTP/1.0\r\nHost: localhost\r\n\r\n')
         fd.flush()
         result = fd.read()
@@ -617,7 +618,7 @@ class TestHttpd(LimitedTestCase):
     def test_023_bad_content_length(self):
         sock = eventlet.connect(
             ('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET / HTTP/1.0\r\nHost: localhost\r\nContent-length: argh\r\n\r\n')
         fd.flush()
         result = fd.read()
@@ -637,7 +638,7 @@ class TestHttpd(LimitedTestCase):
                 return [text]
         self.site.application = wsgi_app
         sock = eventlet.connect(('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('PUT / HTTP/1.1\r\nHost: localhost\r\nContent-length: 1025\r\nExpect: 100-continue\r\n\r\n')
         fd.flush()
         response_line, headers, body = read_http(sock)
@@ -680,7 +681,7 @@ class TestHttpd(LimitedTestCase):
                 eventlet.connect(('localhost', self.port))
                 self.fail("Didn't expect to connect")
             except socket.error, exc:
-                self.assertEquals(exc[0], errno.ECONNREFUSED)
+                self.assertEquals(get_errno(exc), errno.ECONNREFUSED)
 
             self.assert_('Invalid argument' in self.logfile.getvalue(),
                 self.logfile.getvalue())
@@ -724,7 +725,7 @@ class TestHttpd(LimitedTestCase):
     def test_027_keepalive_chunked(self):
         self.site.application = chunked_post
         sock = eventlet.connect(('localhost', self.port))
-        fd = sock.makefile()
+        fd = sock.makefile('w')
         fd.write('PUT /a HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n')
         fd.flush()
         read_http(sock)
@@ -780,7 +781,7 @@ class TestHttpd(LimitedTestCase):
         sock = eventlet.connect(
             ('localhost', self.port))
 
-        fd = sock.makefile()
+        fd = sock.makefile('rw')
         fd.write('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
         fd.flush()
         response = fd.read().split('\r\n')

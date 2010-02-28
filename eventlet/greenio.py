@@ -1,3 +1,4 @@
+from eventlet.common import get_errno
 from eventlet.hubs import trampoline
 BUFFER_SIZE = 4096
 
@@ -21,19 +22,6 @@ try:
 except AttributeError:
    def _fileobject(sock, *args, **kwargs):
         return _original_socket.makefile(sock, *args, **kwargs)
-
-def get_errno(exc):
-    """ Get the error code out of socket.error objects. 
-    socket.error in <2.5 does not have errno attribute
-    socket.error in 3.x does not allow indexing access 
-    """
-    try:
-        return exc.args[0]
-    except (TypeError,IndexError):
-        try:
-            return exc.errno
-        except AttributeError:
-            return None
 
 def socket_connect(descriptor, address):
     """
@@ -253,10 +241,10 @@ class GreenSocket(object):
     def makefile(self, *args, **kw):
         return _fileobject(self.dup(), *args, **kw)
 
-    def makeGreenFile(self, mode='r', bufsize=-1):
+    def makeGreenFile(self, *args, **kw):
         warnings.warn("makeGreenFile has been deprecated, please use "
             "makefile instead", DeprecationWarning, stacklevel=2)
-        return self.makefile(mode, bufsize)
+        return self.makefile(*args, **kw)
 
     def recv(self, buflen, flags=0):
         fd = self.fd
