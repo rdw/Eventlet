@@ -1,11 +1,14 @@
 import heapq
 import sys
 import traceback
+import warnings
 
 from eventlet.support import greenlets as greenlet, clear_sys_exc_info
 from eventlet.hubs import timer
 from eventlet import patcher
 time = patcher.original('time')
+
+g_prevent_multiple_readers = True
 
 READ="read"
 WRITE="write"
@@ -16,12 +19,12 @@ class FdListener(object):
         self.evtype = evtype
         self.fileno = fileno
         self.cb = cb
-    def __call__(self, *args, **kw):
-        return self.cb(*args, **kw)
     def __repr__(self):
         return "%s(%r, %r, %r)" % (type(self).__name__, self.evtype, self.fileno, self.cb)
     __str__ = __repr__
 
+
+noop = FdListener(READ, 0, lambda x: None)
 
 # in debug mode, track the call site that created the listener
 class DebugListener(FdListener):
@@ -50,6 +53,7 @@ class BaseHub(object):
 
     def __init__(self, clock=time.time):
         self.listeners = {READ:{}, WRITE:{}}
+        self.secondaries = {READ:{}, WRITE:{}}
 
         self.clock = clock
         self.greenlet = greenlet.greenlet(self.run)
@@ -71,23 +75,43 @@ class BaseHub(object):
         is ready for reading/writing.
         """
         listener = self.lclass(evtype, fileno, cb)
-        self.listeners[evtype].setdefault(fileno, []).append(listener)
+        bucket = self.listeners[evtype]
+        if fileno in bucket:
+            if g_prevent_multiple_readers:
+               raise RuntimeError("Second simultaneous %s on fileno %s "\
+                     "detected.  Unless you really know what you're doing, "\
+                     "make sure that only one greenthread can %s any "\
+                     "particular socket.  Consider using a pools.Pool. "\
+                     "If you do know what you're doing and want to disable "\
+                     "this error, call "\
+                     "eventlet.debug.hub_multiple_reader_prevention(False)" % (
+                     evtype, fileno, evtype))
+            # store off the second listener in another structure
+            self.secondaries[evtype].setdefault(fileno, []).append(listener)
+        else:
+            bucket[fileno] = listener
         return listener
 
     def remove(self, listener):
-        listener_list = self.listeners[listener.evtype].pop(listener.fileno, [])
-        try:
-            listener_list.remove(listener)
-        except ValueError:
-            pass
-        if listener_list:
-            self.listeners[listener.evtype][listener.fileno] = listener_list
+        fileno = listener.fileno
+        evtype = listener.evtype
+        self.listeners[evtype].pop(fileno, None)
+        # migrate a secondary listener to be the primary listener
+        if fileno in self.secondaries[evtype]:
+            sec = self.secondaries[evtype].get(fileno, ())
+            if not sec:
+                return
+            self.listeners[evtype][fileno] = sec.pop(0)
+            if not sec:
+                del self.secondaries[evtype][fileno]
 
     def remove_descriptor(self, fileno):
         """ Completely remove all listeners for this fileno.  For internal use
         only."""
         self.listeners[READ].pop(fileno, None)
         self.listeners[WRITE].pop(fileno, None)
+        self.secondaries[READ].pop(fileno, None)
+        self.secondaries[WRITE].pop(fileno, None)
 
     def stop(self):
         self.abort()

@@ -110,6 +110,9 @@ class GreenPool(object):
 
     def waitall(self):
         """Waits until all greenthreads in the pool are finished working."""
+        assert greenthread.getcurrent() not in self.coroutines_running, \
+                          "Calling waitall() from within one of the "\
+                          "GreenPool's greenthreads will never terminate."
         if self.running():
             self.no_coros_running.wait()
 
@@ -151,6 +154,14 @@ class GreenPool(object):
     def imap(self, function, *iterables):
         """This is the same as :func:`itertools.imap`, and has the same
         concurrency and memory behavior as :meth:`starmap`.
+        
+        It's quite convenient for, e.g., farming out jobs from a file::
+           
+           def worker(line):
+               return do_something(line)
+           pool = GreenPool()
+           for result in pool.imap(worker, open("filename", 'r')):
+               print result
         """
         return self.starmap(function, itertools.izip(*iterables))
 

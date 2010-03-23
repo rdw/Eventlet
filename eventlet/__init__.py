@@ -1,4 +1,4 @@
-version_info = (0, 9, 7, 'dev1')
+version_info = (0, 9, 7, "dev1")
 __version__ = ".".join(map(str, version_info))
 
 try:
@@ -32,7 +32,7 @@ try:
     serve = convenience.serve
     StopServe = convenience.StopServe
 
-    getcurrent = greenlet.getcurrent
+    getcurrent = greenlet.greenlet.getcurrent
     
     # deprecated    
     TimeoutError = timeout.Timeout

@@ -108,9 +108,7 @@ class Hub(BaseHub):
         elif evtype is WRITE:
             evt = event.write(fileno, cb, fileno)
 
-        listener = FdListener(evtype, fileno, evt)
-        self.listeners[evtype].setdefault(fileno, []).append(listener)
-        return listener
+        return super(Hub,self).add(evtype, fileno, evt)
 
     def signal(self, signalnum, handler):
         def wrapper():
@@ -127,8 +125,8 @@ class Hub(BaseHub):
 
     def remove_descriptor(self, fileno):
         for lcontainer in self.listeners.itervalues():
-            l_list = lcontainer.pop(fileno, None)
-            for listener in l_list:
+            listener = lcontainer.pop(fileno, None)
+            if listener:
                 try:
                     listener.cb.delete()
                 except self.SYSTEM_EXCEPTIONS:
