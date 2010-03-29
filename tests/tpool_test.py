@@ -141,17 +141,18 @@ class TestTpool(LimitedTestCase):
         
     @skip_with_pyevent
     def test_wrap_iterator2(self):
+        self.reset_timeout(5)  # might take a while due to imprecise sleeping
         def foo():
             import time
-            for x in xrange(10):
+            for x in xrange(2):
                 yield x
-                time.sleep(0.01)
+                time.sleep(0.001)
                 
         counter = [0]
         def tick():
-            for i in xrange(100):
+            for i in xrange(20000):
                 counter[0]+=1
-                eventlet.sleep(0.001)
+                eventlet.sleep()
                 
         gt = eventlet.spawn(tick)
         previtem = 0
@@ -159,7 +160,7 @@ class TestTpool(LimitedTestCase):
             self.assert_(item >= previtem)
         # make sure the tick happened at least a few times so that we know
         # that our iterations in foo() were actually tpooled
-        self.assert_(counter[0] > 10)
+        self.assert_(counter[0] > 10, counter[0])
         gt.wait()
 
 
